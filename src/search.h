@@ -59,3 +59,4 @@
 */
 
 auto usearch_global(struct Parameters const & parameters, char * cmdline, char * progheader) -> void;
+auto usearch_global_server(struct Parameters const & parameters, char * cmdline, char * progheader, char * query_file) -> void;

@@ -105,6 +105,7 @@
 #include <limits>
 #include <string>
 #include <vector>
+#include "mongoose.h" // basic webserver for reusing in the global server mode
 
 
 constexpr int64_t n_threads_max = 1024;
@@ -138,6 +139,7 @@ bool opt_sizeout;
 bool opt_xee;
 bool opt_xlength;
 bool opt_xsize;
+bool opt_log_server_busy_time = false;
 char * opt_alnout;
 char * opt_biomout;
 char * opt_blast6out;
@@ -203,6 +205,7 @@ char * opt_uchime_ref;
 char * opt_uchimealns;
 char * opt_uchimeout;
 char * opt_userout;
+char * opt_temp_file_path = nullptr;
 double * opt_ee_cutoffs_values;
 double opt_abskew;
 double opt_chimeras_diff_pct;
@@ -257,6 +260,7 @@ int opt_mindiffs;
 int opt_slots;
 int opt_uchimeout5;
 int opt_usersort;
+int opt_port;
 int64_t opt_dbmask;
 int64_t opt_fasta_width;
 int64_t opt_fastq_ascii;
@@ -343,6 +347,7 @@ static time_t time_start;
 static time_t time_finish;
 
 std::FILE * fp_log = nullptr;
+
 
 
 // anonymous namespace: limit visibility and usage to this translation unit
@@ -771,8 +776,8 @@ auto args_init(int argc, char ** argv, struct Parameters & parameters) -> void
   /* Set defaults */
   static constexpr auto int_max = std::numeric_limits<int>::max();
   static constexpr auto long_min = std::numeric_limits<long>::min();
-  static constexpr auto number_of_commands = std::size_t{50};
-  static constexpr auto number_of_options = std::size_t{247};
+  static constexpr auto number_of_commands = std::size_t{51};
+  static constexpr auto number_of_options = std::size_t{251};
   static constexpr auto max_number_of_options_per_command = std::size_t{99};
 
   parameters.progname = argv[0];
@@ -983,6 +988,9 @@ auto args_init(int argc, char ** argv, struct Parameters & parameters) -> void
   opt_xlength = false;
   opt_xn = 8.0;
   opt_xsize = false;
+  opt_port = 8000;
+  opt_log_server_busy_time = false;
+  opt_temp_file_path = "/tmp/";
 
   opterr = 1;
 
@@ -1233,7 +1241,11 @@ auto args_init(int argc, char ** argv, struct Parameters & parameters) -> void
       option_xee,
       option_xlength,
       option_xn,
-      option_xsize
+      option_xsize,
+      option_usearch_global_server,
+      option_port,
+      option_temp_file_path,
+      option_log_server_busy_time,
     };
 
   static constexpr std::array<struct option, number_of_options> long_options =
@@ -1484,6 +1496,10 @@ auto args_init(int argc, char ** argv, struct Parameters & parameters) -> void
       {"xlength",               no_argument,       nullptr, 0 },
       {"xn",                    required_argument, nullptr, 0 },
       {"xsize",                 no_argument,       nullptr, 0 },
+      {"usearch_global_server", no_argument, nullptr, 0 },
+      {"port",                  required_argument, nullptr, 0 },
+      {"temp_file_path",    required_argument, nullptr, 0 },
+      {"log_server_busy_time",  no_argument,       nullptr, 0 },
       { nullptr,                0,                 nullptr, 0 }
       }};
 
@@ -1519,6 +1535,22 @@ auto args_init(int argc, char ** argv, struct Parameters & parameters) -> void
         case option_usearch_global:
           parameters.opt_usearch_global = optarg;
           break;
+
+        case option_usearch_global_server:
+          parameters.opt_usearch_global_server = true;
+          break;
+        
+        case option_port:
+          opt_port = args_getlong(optarg);
+          break;
+
+        case option_temp_file_path:
+          opt_temp_file_path = optarg;
+          break;
+        
+        case option_log_server_busy_time:
+          opt_log_server_busy_time = true;
+          break;        
 
         case option_db:
           opt_db = optarg;
@@ -2709,6 +2741,7 @@ auto args_init(int argc, char ** argv, struct Parameters & parameters) -> void
       option_udbinfo,
       option_udbstats,
       option_usearch_global,
+      option_usearch_global_server,
       option_v,
       option_version
     };
@@ -4568,6 +4601,106 @@ auto args_init(int argc, char ** argv, struct Parameters & parameters) -> void
         option_xsize,
         -1 },
 
+      { option_usearch_global_server,
+        option_port,
+        option_temp_file_path,
+        option_log_server_busy_time,
+        option_alnout,
+        option_band,
+        option_biomout,
+        option_blast6out,
+        option_bzip2_decompress,
+        option_db,
+        option_dbmask,
+        option_dbmatched,
+        option_dbnotmatched,
+        option_fasta_width,
+        option_fastapairs,
+        option_fulldp,
+        option_gapext,
+        option_gapopen,
+        option_gzip_decompress,
+        option_hardmask,
+        option_hspw,
+        option_id,
+        option_iddef,
+        option_idprefix,
+        option_idsuffix,
+        option_label_suffix,
+        option_lca_cutoff,
+        option_lcaout,
+        option_leftjust,
+        option_lengthout,
+        option_log,
+        option_match,
+        option_matched,
+        option_maxaccepts,
+        option_maxdiffs,
+        option_maxgaps,
+        option_maxhits,
+        option_maxid,
+        option_maxqsize,
+        option_maxqt,
+        option_maxrejects,
+        option_maxseqlength,
+        option_maxsizeratio,
+        option_maxsl,
+        option_maxsubs,
+        option_mid,
+        option_mincols,
+        option_minhsp,
+        option_minqt,
+        option_minseqlength,
+        option_minsizeratio,
+        option_minsl,
+        option_mintsize,
+        option_minwordmatches,
+        option_mismatch,
+        option_mothur_shared_out,
+        option_n_mismatch,
+        option_no_progress,
+        option_notmatched,
+        option_notrunclabels,
+        option_otutabout,
+        option_output_no_hits,
+        option_pattern,
+        option_qmask,
+        option_qsegout,
+        option_query_cov,
+        option_quiet,
+        option_relabel,
+        option_relabel_keep,
+        option_relabel_md5,
+        option_relabel_self,
+        option_relabel_sha1,
+        option_rightjust,
+        option_rowlen,
+        option_samheader,
+        option_samout,
+        option_sample,
+        option_self,
+        option_selfid,
+        option_sizein,
+        option_sizeout,
+        option_slots,
+        option_strand,
+        option_target_cov,
+        option_threads,
+        option_top_hits_only,
+        option_tsegout,
+        option_uc,
+        option_uc_allhits,
+        option_userfields,
+        option_userout,
+        option_weak_id,
+        option_wordlength,
+        option_xdrop_nw,
+        option_xee,
+        option_xlength,
+        option_xsize,
+        -1 },
+
+
       { option_v,
         option_log,
         option_quiet,
@@ -4680,7 +4813,7 @@ auto args_init(int argc, char ** argv, struct Parameters & parameters) -> void
   if ((parameters.opt_allpairs_global != nullptr) or (parameters.opt_cluster_fast != nullptr) or (parameters.opt_cluster_size != nullptr) or
       (parameters.opt_cluster_smallmem != nullptr) or (parameters.opt_cluster_unoise != nullptr) or (parameters.opt_fastq_mergepairs != nullptr) or
       (parameters.opt_fastx_mask != nullptr) or (parameters.opt_maskfasta != nullptr) or (parameters.opt_search_exact != nullptr) or (parameters.opt_sintax != nullptr) or
-      (parameters.opt_uchime_ref != nullptr) or (parameters.opt_usearch_global != nullptr))
+      (parameters.opt_uchime_ref != nullptr) or (parameters.opt_usearch_global != nullptr) or (parameters.opt_usearch_global_server == true))
     {
       if (parameters.opt_threads == 0)
         {
@@ -5017,7 +5150,8 @@ auto args_init(int argc, char ** argv, struct Parameters & parameters) -> void
           (parameters.opt_derep_prefix != nullptr) or
           (parameters.opt_makeudb_usearch != nullptr) or
           (parameters.opt_sintax != nullptr) or
-          (parameters.opt_usearch_global != nullptr))
+          (parameters.opt_usearch_global != nullptr) or
+          (parameters.opt_usearch_global_server == true))
         {
           opt_minseqlength = 32;
           parameters.opt_minseqlength = 32;
@@ -5644,6 +5778,248 @@ auto cmd_usearch_global(struct Parameters const & parameters) -> void
   usearch_global(parameters, cmdline, prog_header.data());
 }
 
+static std::mutex vsearch_server_mutex; // mutex for global server mode
+
+// atomic flag to indicate if vsearch is busy processing a request
+static std::atomic<bool> vsearch_busy(false);
+
+// RAII class to set and clear the busy flag
+// NOTE: Currently redundant because the Mongoose event loop is blocking.
+// Kept intentionally to protect against future concurrency/refactors.
+struct BusyGuard {
+  std::atomic<bool>& flag;
+  std::chrono::steady_clock::time_point start;
+
+  BusyGuard(std::atomic<bool>& f)
+    : flag(f),
+      start(std::chrono::steady_clock::now()) {}
+
+  ~BusyGuard() {
+    flag.store(false);
+
+    if(opt_log_server_busy_time) {
+    auto end = std::chrono::steady_clock::now();
+    auto ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+
+    fprintf(stderr, "[vsearch-server] busy for %lld ms\n",
+            (long long) ms);
+    }
+  }
+};
+
+// RAII class to clean up temporary files
+struct CleanupGuard {
+  std::string query;
+  std::string blast6;
+  std::string aln;
+
+  ~CleanupGuard() {
+    if (!query.empty())  unlink(query.c_str());
+    if (!blast6.empty()) unlink(blast6.c_str());
+    if (!aln.empty())    unlink(aln.c_str());
+  }
+};
+
+struct ServerContext {
+  const Parameters *parameters;
+  const char *cmdline;
+  const std::string *prog_header;
+};
+
+
+static std::string write_temp_fasta(const char *sequence)
+{
+  char tmpl[PATH_MAX];
+
+  snprintf(tmpl, sizeof(tmpl),
+           "%s/vsearch-query-XXXXXX",
+           opt_temp_file_path);
+
+  int fd = mkstemp(tmpl);
+  if (fd == -1)
+    fatal("mkstemp failed for query file");
+
+  FILE *f = fdopen(fd, "w");
+  if (!f)
+    {
+      close(fd);
+      unlink(tmpl);
+      fatal("fdopen failed for query file");
+    }
+
+  fprintf(f, ">search\n%s\n", sequence);
+  fclose(f);  // also closes fd
+
+  return std::string(tmpl);
+}
+
+static std::string make_temp_output(const char *prefix)
+{
+  if (!opt_temp_file_path || !*opt_temp_file_path)
+    fatal("opt_temp_file_path not set");
+
+  char tmpl[PATH_MAX];
+
+  snprintf(tmpl, sizeof(tmpl),
+           "%s/%s-XXXXXX",
+           opt_temp_file_path,
+           prefix);
+
+  int fd = mkstemp(tmpl);
+  if (fd == -1)
+    fatal("mkstemp failed for output file");
+
+  close(fd); // vsearch will reopen by name
+  return std::string(tmpl);
+}
+
+// Runs on each HTTP request
+static void ev_handler(struct mg_connection *c,
+                       int ev,
+                       void *ev_data)
+{
+  if (ev != MG_EV_HTTP_MSG)
+    return;
+
+  auto *ctx = static_cast<ServerContext *>(c->fn_data);
+  const Parameters &parameters = *ctx->parameters;
+
+  struct mg_http_message *hm = (struct mg_http_message *) ev_data;
+
+  // Extract sequence parameter
+  long max_sequence_length = 2048;
+  char sequence[max_sequence_length];
+  char outfmt[1024];
+  mg_http_get_var(&hm->query, "outfmt", outfmt, sizeof(outfmt));  
+  if (mg_http_get_var(&hm->query,
+                    "sequence",
+                    sequence,
+                    sizeof(sequence)) <= 0) {
+    mg_http_reply(c,
+              400,
+              "Content-Type: text/plain\r\n",
+              "Missing or too-long sequence (max allowed length: %ld)\n",
+              max_sequence_length);
+      return;
+    }
+
+  bool expected = false;
+  if (!vsearch_busy.compare_exchange_strong(expected, true)) {
+    mg_http_reply(c, 503, "", "Server busy\n");
+    return;
+  }
+
+  std::string query_file;
+  std::string blast6_file;
+  std::string aln_file;
+  std::string result;
+
+  BusyGuard guard(vsearch_busy);
+
+  {
+    // 🔒 Serialize all vsearch execution
+    std::lock_guard<std::mutex> lock(vsearch_server_mutex);
+
+    // --- create per-request files ---
+    query_file  = write_temp_fasta(sequence);
+    blast6_file = make_temp_output("vsearch-blast6");
+    aln_file    = make_temp_output("vsearch-aln");
+
+    // Save original globals
+    char *old_blast6out = opt_blast6out;
+    char *old_alnout    = opt_alnout;
+
+    // Override outputs for this request
+    opt_blast6out = const_cast<char *>(blast6_file.c_str());
+    opt_alnout    = const_cast<char *>(aln_file.c_str());
+
+    // Run vsearch
+    usearch_global_server(parameters, cmdline, prog_header.data(), const_cast<char *>(query_file.c_str()));
+
+    // Restore globals
+    opt_blast6out = old_blast6out;
+    opt_alnout    = old_alnout;
+  }
+
+{
+/*   CleanupGuard cleanup{query_file, blast6_file, aln_file};
+ */
+  const char *path =
+    (strcmp(outfmt, "blast6out") == 0)
+      ? blast6_file.c_str()
+      : aln_file.c_str();
+
+  FILE *f = fopen(path, "rb");
+  if (!f) {
+    mg_http_reply(c, 500, "",
+                  "{%m:%m}\n",
+                  MG_ESC("error"),
+                  MG_ESC("Unable to open result file"));
+    return;
+  }
+
+  // Send HTTP headers manually
+  mg_printf(c,
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/plain\r\n"
+            "Transfer-Encoding: chunked\r\n"
+            "\r\n");
+
+  char buf[4096];
+  char chunk[8192 + 64];  // data + header + CRLF
+  size_t n;
+    // Stream results in chunked encoding
+  while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+    int hdr = snprintf(chunk, sizeof(chunk), "%zx\r\n", n);
+    memcpy(chunk + hdr, buf, n);
+    memcpy(chunk + hdr + n, "\r\n", 2);
+
+    mg_send(c, chunk, hdr + n + 2);
+
+    if (c->is_closing) break;
+  }
+
+  fclose(f);
+
+  // Final chunk (must be exact)
+  mg_send(c, "0\r\n\r\n", 5);
+
+  c->is_draining = 1;
+} // cleanup guard runs here
+
+}
+
+
+auto cmd_usearch_global_server(struct Parameters const & parameters) -> void
+{
+   fprintf(stderr, "Starting web server\n");
+   if (opt_port)
+ {
+  fprintf(stdout, "Using port %d\n", opt_port);
+ }
+ // If opt_port is not set, default to 8000
+ // conditionally set port
+ char host[24];
+ static ServerContext ctx{
+    &parameters
+  };
+ if (opt_port) {
+   sprintf(host, "http://0.0.0.0:%d", opt_port);
+ } else {
+   sprintf(host, "http://0.0.0.0:%d", 8000);
+ }
+   struct mg_mgr mgr;  // Declare event manager
+   mg_mgr_init(&mgr);  // Initialise event manager
+   mg_http_listen(&mgr, host, ev_handler, &ctx);  // Setup listener
+   for (;;) {          // infinite event loop
+      mg_mgr_poll(&mgr, 1000);
+   }    
+
+}
+
+
+
 
 auto cmd_search_exact(struct Parameters const & parameters) -> void
 {
@@ -5960,6 +6336,10 @@ auto main(int argc, char** argv) -> int
   else if (parameters.opt_usearch_global != nullptr)
     {
       cmd_usearch_global(parameters);
+    }
+  else if (parameters.opt_usearch_global_server == true)
+    {
+      cmd_usearch_global_server(parameters);
     }
   else if (parameters.opt_sortbysize != nullptr)
     {

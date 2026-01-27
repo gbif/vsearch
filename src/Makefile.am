@@ -215,4 +215,5 @@ utils/open_file.cpp \
 utils/os_byteswap.cpp \
 utils/xpthread.cpp \
 utils/seqcmp.cpp \
+mongoose.cc \
 vsearch.cc

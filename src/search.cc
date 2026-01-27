@@ -115,6 +115,7 @@ static FILE * fp_tsegout = nullptr;
 
 static int count_matched = 0;
 static int count_notmatched = 0;
+static bool db_open = false;
 
 auto search_output_results(std::vector<struct hit> const & hits,
                            char const * query_head,
@@ -685,10 +686,14 @@ auto search_prep(char * cmdline, char * progheader) -> void
 
   if (is_udb)
     {
+       if (!db_open)  // TODO: this is a hack
+      {
       udb_read(opt_db, true, true);
       results_show_samheader(fp_samout, cmdline, opt_db);
       show_rusage();
       seqcount = db_getsequencecount();
+      db_open = true;
+      }
     }
   else
     {
@@ -723,15 +728,17 @@ auto search_prep(char * cmdline, char * progheader) -> void
   tophits = opt_maxrejects + opt_maxaccepts + MAXDELAYED;
 
   tophits = std::min(tophits, seqcount);
+
 }
 
 
-auto search_done() -> void
+auto search_done(bool skipCloseDB) -> void
 {
   /* clean up, global */
-
-  dbindex_free();
-  db_free();
+  if (!skipCloseDB) {
+    dbindex_free();
+    db_free();
+  }
 
   if (opt_lcaout != nullptr)
     {
@@ -782,10 +789,10 @@ auto search_done() -> void
 }
 
 
-auto usearch_global(struct Parameters const & parameters, char * cmdline, char * progheader) -> void
+auto usearch_global(struct Parameters const & parameters, char * cmdline, char * progheader, char * fastx, bool skipCloseDB) -> void
 {
   search_prep(cmdline, progheader);
-
+  
   if (opt_dbmatched != nullptr)
     {
       fp_dbmatched = fopen_output(opt_dbmatched);
@@ -814,7 +821,8 @@ auto usearch_global(struct Parameters const & parameters, char * cmdline, char *
   qmatches_abundance = 0;
   queries = 0;
   queries_abundance = 0;
-  query_fastx_h = fastx_open(parameters.opt_usearch_global);
+  // Modification for server mode to avoid segment fault
+  query_fastx_h = fastx_open(fastx);
 
   /* allocate memory for thread info */
   si_plus = (struct searchinfo_s *) xmalloc(opt_threads *
@@ -982,5 +990,15 @@ auto usearch_global(struct Parameters const & parameters, char * cmdline, char *
       fclose(fp_dbnotmatched);
     }
 
-  search_done();
+  search_done(skipCloseDB);
+}
+
+auto usearch_global(struct Parameters const & parameters, char * cmdline, char * progheader) -> void
+{
+  usearch_global(parameters, cmdline, progheader, parameters.opt_usearch_global, false); // original behaviour
+}
+
+auto usearch_global_server(struct Parameters const & parameters, char * cmdline, char * progheader, char * query_file) -> void
+{
+  usearch_global(parameters, cmdline, progheader, query_file, true);   // skips the udb opening
 }
