@@ -5943,8 +5943,8 @@ static void ev_handler(struct mg_connection *c,
   }
 
 {
-/*   CleanupGuard cleanup{query_file, blast6_file, aln_file};
- */
+  CleanupGuard cleanup{query_file, blast6_file, aln_file};
+// --- stream result file ---
   const char *path =
     (strcmp(outfmt, "blast6out") == 0)
       ? blast6_file.c_str()
@@ -5990,10 +5990,58 @@ static void ev_handler(struct mg_connection *c,
 
 }
 
+auto cmd_usearch_global_server_load_db(struct Parameters const & parameters) -> void
+{
+
+bool expected = false;
+  if (!vsearch_busy.compare_exchange_strong(expected, true)) {
+    fatal("VSEARCH server is already busy, cannot load database");
+  }
+
+  std::string query_file;
+  std::string blast6_file;
+  std::string aln_file;
+  std::string result;
+
+  BusyGuard guard(vsearch_busy);
+
+    {
+
+    // 🔒 Serialize all vsearch execution
+    std::lock_guard<std::mutex> lock(vsearch_server_mutex);
+
+    // --- create files for a  files ---
+    query_file  = write_temp_fasta("ACGT");
+    blast6_file = make_temp_output("vsearch-blast6");
+    aln_file    = make_temp_output("vsearch-aln");
+
+    // Save original globals
+    char *old_blast6out = opt_blast6out;
+    char *old_alnout    = opt_alnout;
+
+    // Override outputs for this request
+    opt_blast6out = const_cast<char *>(blast6_file.c_str());
+    opt_alnout    = const_cast<char *>(aln_file.c_str());
+
+    // Run vsearch
+    usearch_global_server(parameters, cmdline, prog_header.data(), const_cast<char *>(query_file.c_str()));
+
+    // Restore globals
+    opt_blast6out = old_blast6out;
+    opt_alnout    = old_alnout;
+  }
+  CleanupGuard cleanup{query_file, blast6_file, aln_file};
+
+
+}
 
 auto cmd_usearch_global_server(struct Parameters const & parameters) -> void
 {
-   fprintf(stderr, "Starting web server\n");
+  // Load database into memory
+  fprintf(stdout, "Loading usearch database into memory for server mode\n");
+  cmd_usearch_global_server_load_db(parameters);
+  fprintf(stdout, "usearch database loaded\n");
+  fprintf(stdout, "Starting web server\n");
    if (opt_port)
  {
   fprintf(stdout, "Using port %d\n", opt_port);
