@@ -106,7 +106,8 @@
 #include <string>
 #include <vector>
 #include "mongoose.h" // basic webserver for reusing in the global server mode
-
+#include <atomic> // were missing for build to complete
+#include <mutex> // were missing for build to complete
 
 constexpr int64_t n_threads_max = 1024;
 constexpr auto max_line_length = std::size_t{80};
