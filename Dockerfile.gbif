@@ -1,0 +1,61 @@
+FROM alpine:3.23 AS make-stage
+
+ARG SYSTEM_USER=stackable
+
+# Install common tools
+RUN apk update && \
+    apk add wget vim libstdc++ zlib-dev bzip2-dev autoconf automake make g++ && \
+    apk cache clean
+
+RUN addgroup -S supergroup && \ 
+    adduser -S -s /bin/bash -G supergroup -h /home/${SYSTEM_USER} ${SYSTEM_USER}
+
+USER ${SYSTEM_USER}
+
+RUN mkdir /home/${SYSTEM_USER}/build
+WORKDIR /home/${SYSTEM_USER}/build
+
+#Copy source
+COPY --chown=${SYSTEM_USER}:supergroup . .
+#Build
+RUN ./autogen.sh && \
+    ./configure --prefix /home/${SYSTEM_USER} CFLAGS="-O3" CXXFLAGS="-O3" && \
+    make clean && \
+    make && \
+    make install && \
+    make clean
+
+#---------
+
+FROM alpine:3.23
+
+ARG SYSTEM_USER=stackable
+ARG SYSTEM_ARCH
+ARG HADOOP_VERSION=3.3.6
+
+# Install common tools
+RUN apk update && \
+    apk add wget vim tar bash libstdc++ zlib-dev bzip2-dev openjdk11-jre kubectl && \
+    apk cache clean
+
+RUN addgroup -S supergroup && \ 
+    adduser -S -s /bin/bash -G supergroup -h /home/${SYSTEM_USER} ${SYSTEM_USER}
+
+USER ${SYSTEM_USER}
+WORKDIR /home/${SYSTEM_USER}
+RUN mkdir -p /home/${SYSTEM_USER}/logs && \
+    mkdir -p /home/${SYSTEM_USER}/config
+
+RUN wget https://dlcdn.apache.org/hadoop/common/hadoop-${HADOOP_VERSION}/hadoop-${HADOOP_VERSION}${SYSTEM_ARCH}.tar.gz -O /home/${SYSTEM_USER}/hadoop.tar.gz && \
+    tar -zxf /home/${SYSTEM_USER}/hadoop.tar.gz -C /home/${SYSTEM_USER} && \
+    rm /home/${SYSTEM_USER}/hadoop.tar.gz
+
+USER root
+
+COPY --from=make-stage "/home/${SYSTEM_USER}/bin/vsearch" "/usr/local/bin"
+
+RUN chmod a+x "/usr/local/bin/vsearch"
+
+USER ${SYSTEM_USER}
+
+ENTRYPOINT ["/bin/bash", "--"]
