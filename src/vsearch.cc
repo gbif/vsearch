@@ -5875,6 +5875,11 @@ static std::string make_temp_output(const char *prefix)
   return std::string(tmpl);
 }
 
+static bool uri_equals(struct mg_str uri, const char *path) {
+  return uri.len == strlen(path) &&
+         memcmp(uri.buf, path, uri.len) == 0;
+}
+
 // Runs on each HTTP request
 static void ev_handler(struct mg_connection *c,
                        int ev,
@@ -5882,113 +5887,126 @@ static void ev_handler(struct mg_connection *c,
 {
   if (ev != MG_EV_HTTP_MSG)
     return;
-
-  auto *ctx = static_cast<ServerContext *>(c->fn_data);
-  const Parameters &parameters = *ctx->parameters;
-
+  
   struct mg_http_message *hm = (struct mg_http_message *) ev_data;
 
-  // Extract sequence parameter
-  long max_sequence_length = 2048;
-  char sequence[max_sequence_length];
-  char outfmt[1024];
-  mg_http_get_var(&hm->query, "outfmt", outfmt, sizeof(outfmt));  
-  if (mg_http_get_var(&hm->query,
-                    "sequence",
-                    sequence,
-                    sizeof(sequence)) <= 0) {
-    mg_http_reply(c,
-              400,
-              "Content-Type: text/plain\r\n",
-              "Missing or too-long sequence (max allowed length: %ld)\n",
-              max_sequence_length);
+   // /health → always OK
+  if (uri_equals(hm->uri, "/health")) {
+    mg_http_reply(c, 200, "Content-Type: text/plain\r\n", "OK\n");
+    return;
+  }
+
+  // /search → run vsearch and return results
+  if (uri_equals(hm->uri, "/search")) {
+    auto *ctx = static_cast<ServerContext *>(c->fn_data);
+    const Parameters &parameters = *ctx->parameters;
+
+    struct mg_http_message *hm = (struct mg_http_message *) ev_data;
+
+    // Extract sequence parameter
+    constexpr size_t max_sequence_length = 2048;
+
+    char sequence[max_sequence_length];
+    char outfmt[1024];
+    mg_http_get_var(&hm->query, "outfmt", outfmt, sizeof(outfmt));  
+    if (mg_http_get_var(&hm->query,
+                      "sequence",
+                      sequence,
+                      sizeof(sequence)) <= 0) {
+      mg_http_reply(c,
+                400,
+                "Content-Type: text/plain\r\n",
+                "Missing or too-long sequence (max allowed length: %ld)\n",
+                max_sequence_length);
+        return;
+      }
+
+    bool expected = false;
+    if (!vsearch_busy.compare_exchange_strong(expected, true)) {
+      mg_http_reply(c, 503, "", "Server busy\n");
       return;
     }
 
-  bool expected = false;
-  if (!vsearch_busy.compare_exchange_strong(expected, true)) {
-    mg_http_reply(c, 503, "", "Server busy\n");
-    return;
-  }
+    std::string query_file;
+    std::string blast6_file;
+    std::string aln_file;
+    std::string result;
 
-  std::string query_file;
-  std::string blast6_file;
-  std::string aln_file;
-  std::string result;
+    BusyGuard guard(vsearch_busy);
 
-  BusyGuard guard(vsearch_busy);
+    {
+      // 🔒 Serialize all vsearch execution
+      std::lock_guard<std::mutex> lock(vsearch_server_mutex);
+
+      // --- create per-request files ---
+      query_file  = write_temp_fasta(sequence);
+      blast6_file = make_temp_output("vsearch-blast6");
+      aln_file    = make_temp_output("vsearch-aln");
+
+      // Save original globals
+      char *old_blast6out = opt_blast6out;
+      char *old_alnout    = opt_alnout;
+
+      // Override outputs for this request
+      opt_blast6out = const_cast<char *>(blast6_file.c_str());
+      opt_alnout    = const_cast<char *>(aln_file.c_str());
+
+      // Run vsearch
+      usearch_global_server(parameters, cmdline, prog_header.data(), const_cast<char *>(query_file.c_str()));
+
+      // Restore globals
+      opt_blast6out = old_blast6out;
+      opt_alnout    = old_alnout;
+    }
 
   {
-    // 🔒 Serialize all vsearch execution
-    std::lock_guard<std::mutex> lock(vsearch_server_mutex);
+    CleanupGuard cleanup{query_file, blast6_file, aln_file};
+  // --- stream result file ---
+    const char *path =
+      (strcmp(outfmt, "blast6out") == 0)
+        ? blast6_file.c_str()
+        : aln_file.c_str();
 
-    // --- create per-request files ---
-    query_file  = write_temp_fasta(sequence);
-    blast6_file = make_temp_output("vsearch-blast6");
-    aln_file    = make_temp_output("vsearch-aln");
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+      mg_http_reply(c, 500, "",
+                    "{%m:%m}\n",
+                    MG_ESC("error"),
+                    MG_ESC("Unable to open result file"));
+      return;
+    }
 
-    // Save original globals
-    char *old_blast6out = opt_blast6out;
-    char *old_alnout    = opt_alnout;
+    // Send HTTP headers manually
+    mg_printf(c,
+              "HTTP/1.1 200 OK\r\n"
+              "Content-Type: text/plain\r\n"
+              "Transfer-Encoding: chunked\r\n"
+              "\r\n");
 
-    // Override outputs for this request
-    opt_blast6out = const_cast<char *>(blast6_file.c_str());
-    opt_alnout    = const_cast<char *>(aln_file.c_str());
+    char buf[4096];
+    char chunk[8192 + 64];  // data + header + CRLF
+    size_t n;
+      // Stream results in chunked encoding
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+      int hdr = snprintf(chunk, sizeof(chunk), "%zx\r\n", n);
+      memcpy(chunk + hdr, buf, n);
+      memcpy(chunk + hdr + n, "\r\n", 2);
 
-    // Run vsearch
-    usearch_global_server(parameters, cmdline, prog_header.data(), const_cast<char *>(query_file.c_str()));
+      mg_send(c, chunk, hdr + n + 2);
 
-    // Restore globals
-    opt_blast6out = old_blast6out;
-    opt_alnout    = old_alnout;
+      if (c->is_closing) break;
+    }
+
+    fclose(f);
+
+    // Final chunk (must be exact)
+    mg_send(c, "0\r\n\r\n", 5);
+
+    c->is_draining = 1;
+    } // cleanup guard runs here
+  } else {
+  mg_http_reply(c, 404, "Content-Type: text/plain\r\n", "Not found\n"); 
   }
-
-{
-  CleanupGuard cleanup{query_file, blast6_file, aln_file};
-// --- stream result file ---
-  const char *path =
-    (strcmp(outfmt, "blast6out") == 0)
-      ? blast6_file.c_str()
-      : aln_file.c_str();
-
-  FILE *f = fopen(path, "rb");
-  if (!f) {
-    mg_http_reply(c, 500, "",
-                  "{%m:%m}\n",
-                  MG_ESC("error"),
-                  MG_ESC("Unable to open result file"));
-    return;
-  }
-
-  // Send HTTP headers manually
-  mg_printf(c,
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: text/plain\r\n"
-            "Transfer-Encoding: chunked\r\n"
-            "\r\n");
-
-  char buf[4096];
-  char chunk[8192 + 64];  // data + header + CRLF
-  size_t n;
-    // Stream results in chunked encoding
-  while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
-    int hdr = snprintf(chunk, sizeof(chunk), "%zx\r\n", n);
-    memcpy(chunk + hdr, buf, n);
-    memcpy(chunk + hdr + n, "\r\n", 2);
-
-    mg_send(c, chunk, hdr + n + 2);
-
-    if (c->is_closing) break;
-  }
-
-  fclose(f);
-
-  // Final chunk (must be exact)
-  mg_send(c, "0\r\n\r\n", 5);
-
-  c->is_draining = 1;
-} // cleanup guard runs here
-
 }
 
 auto cmd_usearch_global_server_load_db(struct Parameters const & parameters) -> void
@@ -6054,9 +6072,9 @@ auto cmd_usearch_global_server(struct Parameters const & parameters) -> void
     &parameters
   };
  if (opt_port) {
-   sprintf(host, "http://0.0.0.0:%d", opt_port);
+   snprintf(host, sizeof(host), "http://:%d", opt_port);
  } else {
-   sprintf(host, "http://0.0.0.0:%d", 8000);
+   snprintf(host, sizeof(host), "http://:%d", 8000);
  }
    struct mg_mgr mgr;  // Declare event manager
    mg_mgr_init(&mgr);  // Initialise event manager
