@@ -108,6 +108,10 @@
 #include "mongoose.h" // basic webserver for reusing in the global server mode
 #include <atomic> // were missing for build to complete
 #include <mutex> // were missing for build to complete
+#include <thread>
+#include <unordered_map>
+#include <queue>
+#include <condition_variable>
 
 constexpr int64_t n_threads_max = 1024;
 constexpr auto max_line_length = std::size_t{80};
@@ -5826,7 +5830,32 @@ struct ServerContext {
   const Parameters *parameters;
   const char *cmdline;
   const std::string *prog_header;
+  mg_mgr *mgr;
 };
+
+// Per-request result stored while the worker thread is running
+struct PendingSearchResult {
+  std::string outfmt;
+  std::string query_file;
+  std::string blast6_file;
+  std::string aln_file;
+};
+
+static std::mutex pending_results_mutex;
+static std::unordered_map<unsigned long, PendingSearchResult> pending_results;
+
+// Queue of incoming search jobs processed one at a time by the worker thread
+struct SearchJob {
+  unsigned long conn_id;
+  mg_mgr       *mgr;
+  const Parameters *parameters;
+  std::string  sequence;
+  std::string  outfmt;
+};
+
+static std::queue<SearchJob>      search_queue;
+static std::mutex                 search_queue_mutex;
+static std::condition_variable    search_queue_cv;
 
 
 static std::string write_temp_fasta(const char *sequence)
@@ -5880,133 +5909,164 @@ static bool uri_equals(struct mg_str uri, const char *path) {
          memcmp(uri.buf, path, uri.len) == 0;
 }
 
-// Runs on each HTTP request
+// Persistent worker thread: drains search_queue one job at a time
+static void search_worker()
+{
+  for (;;) {
+    SearchJob job;
+    {
+      std::unique_lock<std::mutex> lock(search_queue_mutex);
+      search_queue_cv.wait(lock, [] { return !search_queue.empty(); });
+      job = std::move(search_queue.front());
+      search_queue.pop();
+    }
+
+    PendingSearchResult res;
+    res.outfmt = job.outfmt;
+
+    vsearch_busy.store(true);
+    BusyGuard guard(vsearch_busy);
+
+    {
+      std::lock_guard<std::mutex> lock(vsearch_server_mutex);
+
+      res.query_file  = write_temp_fasta(job.sequence.c_str());
+      res.blast6_file = make_temp_output("vsearch-blast6");
+      res.aln_file    = make_temp_output("vsearch-aln");
+
+      char *old_blast6out = opt_blast6out;
+      char *old_alnout    = opt_alnout;
+      opt_blast6out = const_cast<char *>(res.blast6_file.c_str());
+      opt_alnout    = const_cast<char *>(res.aln_file.c_str());
+
+      usearch_global_server(*job.parameters, cmdline, prog_header.data(),
+                            const_cast<char *>(res.query_file.c_str()));
+
+      opt_blast6out = old_blast6out;
+      opt_alnout    = old_alnout;
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(pending_results_mutex);
+      pending_results[job.conn_id] = std::move(res);
+    }
+
+    if (!mg_wakeup(job.mgr, job.conn_id, "", 0)) {
+      // Client disconnected before we could reply — clean up temp files
+      std::lock_guard<std::mutex> lock(pending_results_mutex);
+      auto it = pending_results.find(job.conn_id);
+      if (it != pending_results.end()) {
+        CleanupGuard cleanup{it->second.query_file,
+                             it->second.blast6_file,
+                             it->second.aln_file};
+        pending_results.erase(it);
+      }
+    }
+  }
+}
+
+// Stream a result file as a chunked HTTP response (called from event loop thread)
+static void stream_search_result(struct mg_connection *c, PendingSearchResult &res)
+{
+  CleanupGuard cleanup{res.query_file, res.blast6_file, res.aln_file};
+
+  const char *path =
+    (res.outfmt == "blast6out")
+      ? res.blast6_file.c_str()
+      : res.aln_file.c_str();
+
+  FILE *f = fopen(path, "rb");
+  if (!f) {
+    mg_http_reply(c, 500, "",
+                  "{%m:%m}\n",
+                  MG_ESC("error"),
+                  MG_ESC("Unable to open result file"));
+    return;
+  }
+
+  mg_printf(c,
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/plain\r\n"
+            "Transfer-Encoding: chunked\r\n"
+            "\r\n");
+
+  char buf[4096];
+  char chunk[8192 + 64];
+  size_t n;
+  while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+    int hdr = snprintf(chunk, sizeof(chunk), "%zx\r\n", n);
+    memcpy(chunk + hdr, buf, n);
+    memcpy(chunk + hdr + n, "\r\n", 2);
+    mg_send(c, chunk, hdr + n + 2);
+    if (c->is_closing) break;
+  }
+
+  fclose(f);
+  mg_send(c, "0\r\n\r\n", 5);
+  c->is_draining = 1;
+}
+
+// Runs on each HTTP event
 static void ev_handler(struct mg_connection *c,
                        int ev,
                        void *ev_data)
 {
+  // Worker thread finished a search — stream the result back on the event loop thread.
+  if (ev == MG_EV_WAKEUP) {
+    PendingSearchResult res;
+    {
+      std::lock_guard<std::mutex> lock(pending_results_mutex);
+      auto it = pending_results.find(c->id);
+      if (it == pending_results.end()) return;
+      res = std::move(it->second);
+      pending_results.erase(it);
+    }
+    stream_search_result(c, res);
+    return;
+  }
+
   if (ev != MG_EV_HTTP_MSG)
     return;
-  
+
   struct mg_http_message *hm = (struct mg_http_message *) ev_data;
 
-   // /health → always OK
+  // /health → always OK, never blocked by a running search
   if (uri_equals(hm->uri, "/health")) {
     mg_http_reply(c, 200, "Content-Type: text/plain\r\n", "OK\n");
     return;
   }
 
-  // /search → run vsearch and return results
+  // /search → hand off to a worker thread so the event loop stays free
   if (uri_equals(hm->uri, "/search")) {
     auto *ctx = static_cast<ServerContext *>(c->fn_data);
-    const Parameters &parameters = *ctx->parameters;
 
-    struct mg_http_message *hm = (struct mg_http_message *) ev_data;
-
-    // Extract sequence parameter
     constexpr size_t max_sequence_length = 2048;
-
     char sequence[max_sequence_length];
     char outfmt[1024];
-    mg_http_get_var(&hm->query, "outfmt", outfmt, sizeof(outfmt));  
+    mg_http_get_var(&hm->query, "outfmt", outfmt, sizeof(outfmt));
     if (mg_http_get_var(&hm->query,
-                      "sequence",
-                      sequence,
-                      sizeof(sequence)) <= 0) {
+                        "sequence",
+                        sequence,
+                        sizeof(sequence)) <= 0) {
       mg_http_reply(c,
-                400,
-                "Content-Type: text/plain\r\n",
-                "Missing or too-long sequence (max allowed length: %ld)\n",
-                max_sequence_length);
-        return;
-      }
-
-    bool expected = false;
-    if (!vsearch_busy.compare_exchange_strong(expected, true)) {
-      mg_http_reply(c, 503, "", "Server busy\n");
+                    400,
+                    "Content-Type: text/plain\r\n",
+                    "Missing or too-long sequence (max allowed length: %ld)\n",
+                    max_sequence_length);
       return;
     }
-
-    std::string query_file;
-    std::string blast6_file;
-    std::string aln_file;
-    std::string result;
-
-    BusyGuard guard(vsearch_busy);
 
     {
-      // 🔒 Serialize all vsearch execution
-      std::lock_guard<std::mutex> lock(vsearch_server_mutex);
-
-      // --- create per-request files ---
-      query_file  = write_temp_fasta(sequence);
-      blast6_file = make_temp_output("vsearch-blast6");
-      aln_file    = make_temp_output("vsearch-aln");
-
-      // Save original globals
-      char *old_blast6out = opt_blast6out;
-      char *old_alnout    = opt_alnout;
-
-      // Override outputs for this request
-      opt_blast6out = const_cast<char *>(blast6_file.c_str());
-      opt_alnout    = const_cast<char *>(aln_file.c_str());
-
-      // Run vsearch
-      usearch_global_server(parameters, cmdline, prog_header.data(), const_cast<char *>(query_file.c_str()));
-
-      // Restore globals
-      opt_blast6out = old_blast6out;
-      opt_alnout    = old_alnout;
+      std::lock_guard<std::mutex> lock(search_queue_mutex);
+      search_queue.push({c->id, ctx->mgr, ctx->parameters,
+                         std::string(sequence), std::string(outfmt)});
     }
+    search_queue_cv.notify_one();
 
-  {
-    CleanupGuard cleanup{query_file, blast6_file, aln_file};
-  // --- stream result file ---
-    const char *path =
-      (strcmp(outfmt, "blast6out") == 0)
-        ? blast6_file.c_str()
-        : aln_file.c_str();
-
-    FILE *f = fopen(path, "rb");
-    if (!f) {
-      mg_http_reply(c, 500, "",
-                    "{%m:%m}\n",
-                    MG_ESC("error"),
-                    MG_ESC("Unable to open result file"));
-      return;
-    }
-
-    // Send HTTP headers manually
-    mg_printf(c,
-              "HTTP/1.1 200 OK\r\n"
-              "Content-Type: text/plain\r\n"
-              "Transfer-Encoding: chunked\r\n"
-              "\r\n");
-
-    char buf[4096];
-    char chunk[8192 + 64];  // data + header + CRLF
-    size_t n;
-      // Stream results in chunked encoding
-    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
-      int hdr = snprintf(chunk, sizeof(chunk), "%zx\r\n", n);
-      memcpy(chunk + hdr, buf, n);
-      memcpy(chunk + hdr + n, "\r\n", 2);
-
-      mg_send(c, chunk, hdr + n + 2);
-
-      if (c->is_closing) break;
-    }
-
-    fclose(f);
-
-    // Final chunk (must be exact)
-    mg_send(c, "0\r\n\r\n", 5);
-
-    c->is_draining = 1;
-    } // cleanup guard runs here
-  } else {
-  mg_http_reply(c, 404, "Content-Type: text/plain\r\n", "Not found\n"); 
+    return; // Response will arrive via MG_EV_WAKEUP when the job is processed
   }
+
+  mg_http_reply(c, 404, "Content-Type: text/plain\r\n", "Not found\n");
 }
 
 auto cmd_usearch_global_server_load_db(struct Parameters const & parameters) -> void
@@ -6068,9 +6128,6 @@ auto cmd_usearch_global_server(struct Parameters const & parameters) -> void
  // If opt_port is not set, default to 8000
  // conditionally set port
  char host[24];
- static ServerContext ctx{
-    &parameters
-  };
  if (opt_port) {
    snprintf(host, sizeof(host), "http://:%d", opt_port);
  } else {
@@ -6078,10 +6135,15 @@ auto cmd_usearch_global_server(struct Parameters const & parameters) -> void
  }
    struct mg_mgr mgr;  // Declare event manager
    mg_mgr_init(&mgr);  // Initialise event manager
+   mg_wakeup_init(&mgr); // Enable cross-thread wakeup for async /search responses
+   std::thread(search_worker).detach(); // Single worker thread processes the search queue
+   static ServerContext ctx{
+     &parameters, nullptr, nullptr, &mgr
+   };
    mg_http_listen(&mgr, host, ev_handler, &ctx);  // Setup listener
    for (;;) {          // infinite event loop
       mg_mgr_poll(&mgr, 1000);
-   }    
+   }
 
 }
 
