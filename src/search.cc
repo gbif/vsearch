@@ -78,60 +78,83 @@
 #include <vector>
 
 
-static struct searchinfo_s * si_plus;
-static struct searchinfo_s * si_minus;
-static pthread_t * pthread;
-
-/* global constants/data, no need for synchronization */
-static int tophits; /* the maximum number of hits to keep */
-static int seqcount; /* number of database sequences */
-static pthread_attr_t attr;
-static fastx_handle query_fastx_h;
-
-/* global data protected by mutex */
-static pthread_mutex_t mutex_input;
-static pthread_mutex_t mutex_output;
-static int qmatches;
-static uint64_t qmatches_abundance;
-static int queries;
-static uint64_t queries_abundance;
-static uint64_t * dbmatched;
-static FILE * fp_samout = nullptr;
-static FILE * fp_alnout = nullptr;
-static FILE * fp_userout = nullptr;
-static FILE * fp_blast6out = nullptr;
-static FILE * fp_uc = nullptr;
-static FILE * fp_fastapairs = nullptr;
-static FILE * fp_matched = nullptr;
-static FILE * fp_notmatched = nullptr;
-static FILE * fp_dbmatched = nullptr;
-static FILE * fp_dbnotmatched = nullptr;
-static FILE * fp_otutabout = nullptr;
-static FILE * fp_mothur_shared_out = nullptr;
-static FILE * fp_biomout = nullptr;
-static FILE * fp_lcaout = nullptr;
-static FILE * fp_qsegout = nullptr;
-static FILE * fp_tsegout = nullptr;
-
-static int count_matched = 0;
-static int count_notmatched = 0;
+/* db_open tracks whether the database has been loaded; transitions
+   false→true exactly once (before the server accepts requests) and is
+   never written again, so it is safe as a static. */
 static bool db_open = false;
+
+struct SearchContext {
+  // Thread management
+  struct searchinfo_s *si_plus         = nullptr;
+  struct searchinfo_s *si_minus        = nullptr;
+  pthread_t           *pthread_arr     = nullptr;
+  pthread_attr_t       attr            {};
+
+  // Query input
+  fastx_handle         query_fastx_h   = nullptr;
+
+  // Search constants (set in search_prep)
+  int tophits  = 0;
+  int seqcount = 0;
+
+  // Synchronization
+  pthread_mutex_t mutex_input  {};
+  pthread_mutex_t mutex_output {};
+
+  // Statistics
+  int      qmatches           = 0;
+  uint64_t qmatches_abundance = 0;
+  int      queries            = 0;
+  uint64_t queries_abundance  = 0;
+
+  // DB hit tracking
+  uint64_t *dbmatched = nullptr;
+
+  // Output file pointers (16)
+  FILE *fp_samout            = nullptr;
+  FILE *fp_alnout            = nullptr;
+  FILE *fp_userout           = nullptr;
+  FILE *fp_blast6out         = nullptr;
+  FILE *fp_uc                = nullptr;
+  FILE *fp_fastapairs        = nullptr;
+  FILE *fp_matched           = nullptr;
+  FILE *fp_notmatched        = nullptr;
+  FILE *fp_dbmatched         = nullptr;
+  FILE *fp_dbnotmatched      = nullptr;
+  FILE *fp_otutabout         = nullptr;
+  FILE *fp_mothur_shared_out = nullptr;
+  FILE *fp_biomout           = nullptr;
+  FILE *fp_lcaout            = nullptr;
+  FILE *fp_qsegout           = nullptr;
+  FILE *fp_tsegout           = nullptr;
+
+  // Output line counters
+  int count_matched    = 0;
+  int count_notmatched = 0;
+};
+
+struct ThreadArgs {
+  int64_t       t;
+  SearchContext *ctx;
+};
+
 
 auto search_output_results(std::vector<struct hit> const & hits,
                            char const * query_head,
                            int qseqlen,
                            char const * qsequence,
                            char const * qsequence_rc,
-                           int qsize) -> void
+                           int qsize,
+                           SearchContext *ctx) -> void
 {
-  xpthread_mutex_lock(&mutex_output);
+  xpthread_mutex_lock(&ctx->mutex_output);
 
   /* show results */
   auto const toreport = std::min(opt_maxhits, static_cast<int64_t>(hits.size()));
 
-  if (fp_alnout != nullptr)
+  if (ctx->fp_alnout != nullptr)
     {
-      results_show_alnout(fp_alnout,
+      results_show_alnout(ctx->fp_alnout,
                           hits.data(),
                           toreport,
                           query_head,
@@ -139,17 +162,17 @@ auto search_output_results(std::vector<struct hit> const & hits,
                           qseqlen);
     }
 
-  if (fp_lcaout != nullptr)
+  if (ctx->fp_lcaout != nullptr)
     {
-      results_show_lcaout(fp_lcaout,
+      results_show_lcaout(ctx->fp_lcaout,
                           hits.data(),
                           toreport,
                           query_head);
     }
 
-  if (fp_samout != nullptr)
+  if (ctx->fp_samout != nullptr)
     {
-      results_show_samout(fp_samout,
+      results_show_samout(ctx->fp_samout,
                           hits.data(),
                           toreport,
                           query_head,
@@ -177,18 +200,18 @@ auto search_output_results(std::vector<struct hit> const & hits,
               break;
             }
 
-          if (fp_fastapairs != nullptr)
+          if (ctx->fp_fastapairs != nullptr)
             {
-              results_show_fastapairs_one(fp_fastapairs,
+              results_show_fastapairs_one(ctx->fp_fastapairs,
                                           hp,
                                           query_head,
                                           qsequence,
                                           qsequence_rc);
             }
 
-          if (fp_qsegout != nullptr)
+          if (ctx->fp_qsegout != nullptr)
             {
-              results_show_qsegout_one(fp_qsegout,
+              results_show_qsegout_one(ctx->fp_qsegout,
                                        hp,
                                        query_head,
                                        qsequence,
@@ -196,17 +219,17 @@ auto search_output_results(std::vector<struct hit> const & hits,
                                        qsequence_rc);
             }
 
-          if (fp_tsegout != nullptr)
+          if (ctx->fp_tsegout != nullptr)
             {
-              results_show_tsegout_one(fp_tsegout,
+              results_show_tsegout_one(ctx->fp_tsegout,
                                        hp);
             }
 
-          if (fp_uc != nullptr)
+          if (ctx->fp_uc != nullptr)
             {
               if ((t==0) || (opt_uc_allhits != 0))
                 {
-                  results_show_uc_one(fp_uc,
+                  results_show_uc_one(ctx->fp_uc,
                                       hp,
                                       query_head,
                                       qseqlen,
@@ -214,9 +237,9 @@ auto search_output_results(std::vector<struct hit> const & hits,
                 }
             }
 
-          if (fp_userout != nullptr)
+          if (ctx->fp_userout != nullptr)
             {
-              results_show_userout_one(fp_userout,
+              results_show_userout_one(ctx->fp_userout,
                                        hp,
                                        query_head,
                                        qsequence,
@@ -224,9 +247,9 @@ auto search_output_results(std::vector<struct hit> const & hits,
                                        qsequence_rc);
             }
 
-          if (fp_blast6out != nullptr)
+          if (ctx->fp_blast6out != nullptr)
             {
-              results_show_blast6out_one(fp_blast6out,
+              results_show_blast6out_one(ctx->fp_blast6out,
                                          hp,
                                          query_head,
                                          qseqlen);
@@ -242,9 +265,9 @@ auto search_output_results(std::vector<struct hit> const & hits,
                        qsize);
         }
 
-      if (fp_uc != nullptr)
+      if (ctx->fp_uc != nullptr)
         {
-          results_show_uc_one(fp_uc,
+          results_show_uc_one(ctx->fp_uc,
                               nullptr,
                               query_head,
                               qseqlen,
@@ -253,9 +276,9 @@ auto search_output_results(std::vector<struct hit> const & hits,
 
       if (opt_output_no_hits != 0)
         {
-          if (fp_userout != nullptr)
+          if (ctx->fp_userout != nullptr)
             {
-              results_show_userout_one(fp_userout,
+              results_show_userout_one(ctx->fp_userout,
                                        nullptr,
                                        query_head,
                                        qsequence,
@@ -263,9 +286,9 @@ auto search_output_results(std::vector<struct hit> const & hits,
                                        qsequence_rc);
             }
 
-          if (fp_blast6out != nullptr)
+          if (ctx->fp_blast6out != nullptr)
             {
-              results_show_blast6out_one(fp_blast6out,
+              results_show_blast6out_one(ctx->fp_blast6out,
                                          nullptr,
                                          query_head,
                                          qseqlen);
@@ -275,34 +298,34 @@ auto search_output_results(std::vector<struct hit> const & hits,
 
   if (not hits.empty())
     {
-      count_matched++;
+      ctx->count_matched++;
       if (opt_matched != nullptr)
         {
-          fasta_print_general(fp_matched,
+          fasta_print_general(ctx->fp_matched,
                               nullptr,
                               qsequence,
                               qseqlen,
                               query_head,
                               strlen(query_head),
                               qsize,
-                              count_matched,
+                              ctx->count_matched,
                               -1.0,
                               -1, -1, nullptr, 0.0);
         }
     }
   else
     {
-      count_notmatched++;
+      ctx->count_notmatched++;
       if (opt_notmatched != nullptr)
         {
-          fasta_print_general(fp_notmatched,
+          fasta_print_general(ctx->fp_notmatched,
                               nullptr,
                               qsequence,
                               qseqlen,
                               query_head,
                               strlen(query_head),
                               qsize,
-                              count_notmatched,
+                              ctx->count_notmatched,
                               -1.0,
                               -1, -1, nullptr, 0.0);
         }
@@ -311,19 +334,19 @@ auto search_output_results(std::vector<struct hit> const & hits,
   /* update matching db sequences */
   for (auto const & hit : hits) {
     if (hit.accepted or hit.weak) {
-      dbmatched[hit.target] += opt_sizein ? qsize : 1;
+      ctx->dbmatched[hit.target] += opt_sizein ? qsize : 1;
     }
   }
 
-  xpthread_mutex_unlock(&mutex_output);
+  xpthread_mutex_unlock(&ctx->mutex_output);
 }
 
 
-auto search_query(int64_t t) -> int
+auto search_query(int64_t t, SearchContext *ctx) -> int
 {
   for (int s = 0; s < opt_strand; s++)
     {
-      struct searchinfo_s * si = (s != 0) ? si_minus + t : si_plus + t;
+      struct searchinfo_s * si = (s != 0) ? ctx->si_minus + t : ctx->si_plus + t;
 
       /* mask query */
       if (opt_qmask == MASK_DUST)
@@ -341,16 +364,17 @@ auto search_query(int64_t t) -> int
 
   std::vector<struct hit> hits;
 
-  search_joinhits(si_plus + t,
-                  opt_strand > 1 ? si_minus + t : nullptr,
+  search_joinhits(ctx->si_plus + t,
+                  opt_strand > 1 ? ctx->si_minus + t : nullptr,
                   hits);
 
   search_output_results(hits,
-                        si_plus[t].query_head,
-                        si_plus[t].qseqlen,
-                        si_plus[t].qsequence,
-                        opt_strand > 1 ? si_minus[t].qsequence : nullptr,
-                        si_plus[t].qsize);
+                        ctx->si_plus[t].query_head,
+                        ctx->si_plus[t].qseqlen,
+                        ctx->si_plus[t].qsequence,
+                        opt_strand > 1 ? ctx->si_minus[t].qsequence : nullptr,
+                        ctx->si_plus[t].qsize,
+                        ctx);
 
   /* free memory for alignment strings */
   for (auto const & hit : hits) {
@@ -363,26 +387,26 @@ auto search_query(int64_t t) -> int
 }
 
 
-auto search_thread_run(int64_t t) -> void
+auto search_thread_run(int64_t t, SearchContext *ctx) -> void
 {
   while (true)
     {
-      xpthread_mutex_lock(&mutex_input);
+      xpthread_mutex_lock(&ctx->mutex_input);
 
-      if (fastx_next(query_fastx_h,
+      if (fastx_next(ctx->query_fastx_h,
                      (opt_notrunclabels == 0),
                      chrmap_no_change_vector.data()))
         {
-          char const * qhead = fastx_get_header(query_fastx_h);
-          int const query_head_len = fastx_get_header_length(query_fastx_h);
-          char const * qseq = fastx_get_sequence(query_fastx_h);
-          int const qseqlen = fastx_get_sequence_length(query_fastx_h);
-          int const query_no = fastx_get_seqno(query_fastx_h);
-          int const qsize = fastx_get_abundance(query_fastx_h);
+          char const * qhead = fastx_get_header(ctx->query_fastx_h);
+          int const query_head_len = fastx_get_header_length(ctx->query_fastx_h);
+          char const * qseq = fastx_get_sequence(ctx->query_fastx_h);
+          int const qseqlen = fastx_get_sequence_length(ctx->query_fastx_h);
+          int const query_no = fastx_get_seqno(ctx->query_fastx_h);
+          int const qsize = fastx_get_abundance(ctx->query_fastx_h);
 
           for (int s = 0; s < opt_strand; s++)
             {
-              struct searchinfo_s * si = (s != 0) ? si_minus + t : si_plus + t;
+              struct searchinfo_s * si = (s != 0) ? ctx->si_minus + t : ctx->si_plus + t;
 
               si->query_head_len = query_head_len;
               si->qseqlen = qseqlen;
@@ -408,61 +432,61 @@ auto search_thread_run(int64_t t) -> void
             }
 
           /* plus strand: copy header and sequence */
-          strcpy(si_plus[t].query_head, qhead);
-          strcpy(si_plus[t].qsequence, qseq);
+          strcpy(ctx->si_plus[t].query_head, qhead);
+          strcpy(ctx->si_plus[t].qsequence, qseq);
 
           /* get progress as amount of input file read */
-          uint64_t const progress = fastx_get_position(query_fastx_h);
+          uint64_t const progress = fastx_get_position(ctx->query_fastx_h);
 
           /* let other threads read input */
-          xpthread_mutex_unlock(&mutex_input);
+          xpthread_mutex_unlock(&ctx->mutex_input);
 
           /* minus strand: copy header and reverse complementary sequence */
           if (opt_strand > 1)
             {
-              strcpy(si_minus[t].query_head, si_plus[t].query_head);
-              reverse_complement(si_minus[t].qsequence,
-                                 si_plus[t].qsequence,
-                                 si_plus[t].qseqlen);
+              strcpy(ctx->si_minus[t].query_head, ctx->si_plus[t].query_head);
+              reverse_complement(ctx->si_minus[t].qsequence,
+                                 ctx->si_plus[t].qsequence,
+                                 ctx->si_plus[t].qseqlen);
             }
 
-          int const match = search_query(t);
+          int const match = search_query(t, ctx);
 
           /* lock mutex for update of global data and output */
-          xpthread_mutex_lock(&mutex_output);
+          xpthread_mutex_lock(&ctx->mutex_output);
 
           /* update stats */
-          ++queries;
-          queries_abundance += qsize;
+          ++ctx->queries;
+          ctx->queries_abundance += qsize;
 
           if (match != 0)
             {
-              ++qmatches;
-              qmatches_abundance += qsize;
+              ++ctx->qmatches;
+              ctx->qmatches_abundance += qsize;
             }
 
           /* show progress */
           progress_update(progress);
 
-          xpthread_mutex_unlock(&mutex_output);
+          xpthread_mutex_unlock(&ctx->mutex_output);
         }
       else
         {
-          xpthread_mutex_unlock(&mutex_input);
+          xpthread_mutex_unlock(&ctx->mutex_input);
           break;
         }
     }
 }
 
 
-auto search_thread_init(struct searchinfo_s * si) -> void
+auto search_thread_init(struct searchinfo_s * si, SearchContext *ctx) -> void
 {
   /* thread specific initialiation */
   si->uh = unique_init();
-  si->kmers = (count_t *) xmalloc((seqcount * sizeof(count_t)) + 32);
-  si->m = minheap_init(tophits);
+  si->kmers = (count_t *) xmalloc((ctx->seqcount * sizeof(count_t)) + 32);
+  si->m = minheap_init(ctx->tophits);
   si->hits = (struct hit *) xmalloc
-    (sizeof(struct hit) * (tophits) * opt_strand);
+    (sizeof(struct hit) * (ctx->tophits) * opt_strand);
   si->qsize = 1;
   si->query_head_alloc = 0;
   si->query_head = nullptr;
@@ -504,69 +528,72 @@ auto search_thread_exit(struct searchinfo_s * si) -> void
 }
 
 
-
 auto search_thread_worker(void * vp) -> void *
 {
-  auto t = (int64_t) vp;
-  search_thread_run(t);
+  auto *args = static_cast<ThreadArgs *>(vp);
+  search_thread_run(args->t, args->ctx);
   return nullptr;
 }
 
 
-auto search_thread_worker_run() -> void
+auto search_thread_worker_run(SearchContext *ctx) -> void
 {
   /* initialize threads, start them, join them and return */
 
-  xpthread_attr_init(&attr);
-  xpthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
+  xpthread_attr_init(&ctx->attr);
+  xpthread_attr_setdetachstate(&ctx->attr, PTHREAD_CREATE_JOINABLE);
+
+  auto *thread_args = new ThreadArgs[opt_threads];
 
   /* init and create worker threads, put them into stand-by mode */
   for (int t = 0; t < opt_threads; t++)
     {
-      search_thread_init(si_plus + t);
-      if (si_minus != nullptr)
+      search_thread_init(ctx->si_plus + t, ctx);
+      if (ctx->si_minus != nullptr)
         {
-          search_thread_init(si_minus + t);
+          search_thread_init(ctx->si_minus + t, ctx);
         }
-      xpthread_create(pthread + t, &attr,
-                      search_thread_worker, (void *) (int64_t) t);
+      thread_args[t] = {t, ctx};
+      xpthread_create(ctx->pthread_arr + t, &ctx->attr,
+                      search_thread_worker, &thread_args[t]);
     }
 
   /* finish and clean up worker threads */
   for (int t = 0; t < opt_threads; t++)
     {
-      xpthread_join(pthread[t], nullptr);
-      search_thread_exit(si_plus + t);
-      if (si_minus != nullptr)
+      xpthread_join(ctx->pthread_arr[t], nullptr);
+      search_thread_exit(ctx->si_plus + t);
+      if (ctx->si_minus != nullptr)
         {
-          search_thread_exit(si_minus + t);
+          search_thread_exit(ctx->si_minus + t);
         }
     }
 
-  xpthread_attr_destroy(&attr);
+  delete[] thread_args;
+  xpthread_attr_destroy(&ctx->attr);
 }
 
 
-auto search_prep(char * cmdline, char * progheader) -> void
+auto search_prep(char * cmdline, char * progheader, SearchContext *ctx) -> void
 {
   /* open output files */
 
   if (opt_alnout != nullptr)
     {
-      fp_alnout = fopen_output(opt_alnout);
-      if (fp_alnout == nullptr)
+      ctx->fp_alnout = fopen_output(opt_alnout);
+      if (ctx->fp_alnout == nullptr)
         {
           fatal("Unable to open alignment output file for writing");
         }
 
-      fprintf(fp_alnout, "%s\n", cmdline);
-      fprintf(fp_alnout, "%s\n", progheader);
+      fprintf(ctx->fp_alnout, "%s\n", cmdline);
+      fprintf(ctx->fp_alnout, "%s\n", progheader);
     }
 
   if (opt_lcaout != nullptr)
     {
-      fp_lcaout = fopen_output(opt_lcaout);
-      if (fp_lcaout == nullptr)
+      ctx->fp_lcaout = fopen_output(opt_lcaout);
+      if (ctx->fp_lcaout == nullptr)
         {
           fatal("Unable to open lca output file for writing");
         }
@@ -574,8 +601,8 @@ auto search_prep(char * cmdline, char * progheader) -> void
 
   if (opt_samout != nullptr)
     {
-      fp_samout = fopen_output(opt_samout);
-      if (fp_samout == nullptr)
+      ctx->fp_samout = fopen_output(opt_samout);
+      if (ctx->fp_samout == nullptr)
         {
           fatal("Unable to open SAM output file for writing");
         }
@@ -583,8 +610,8 @@ auto search_prep(char * cmdline, char * progheader) -> void
 
   if (opt_userout != nullptr)
     {
-      fp_userout = fopen_output(opt_userout);
-      if (fp_userout == nullptr)
+      ctx->fp_userout = fopen_output(opt_userout);
+      if (ctx->fp_userout == nullptr)
         {
           fatal("Unable to open user-defined output file for writing");
         }
@@ -592,8 +619,8 @@ auto search_prep(char * cmdline, char * progheader) -> void
 
   if (opt_blast6out != nullptr)
     {
-      fp_blast6out = fopen_output(opt_blast6out);
-      if (fp_blast6out == nullptr)
+      ctx->fp_blast6out = fopen_output(opt_blast6out);
+      if (ctx->fp_blast6out == nullptr)
         {
           fatal("Unable to open blast6-like output file for writing");
         }
@@ -601,8 +628,8 @@ auto search_prep(char * cmdline, char * progheader) -> void
 
   if (opt_uc != nullptr)
     {
-      fp_uc = fopen_output(opt_uc);
-      if (fp_uc == nullptr)
+      ctx->fp_uc = fopen_output(opt_uc);
+      if (ctx->fp_uc == nullptr)
         {
           fatal("Unable to open uc output file for writing");
         }
@@ -610,8 +637,8 @@ auto search_prep(char * cmdline, char * progheader) -> void
 
   if (opt_fastapairs != nullptr)
     {
-      fp_fastapairs = fopen_output(opt_fastapairs);
-      if (fp_fastapairs == nullptr)
+      ctx->fp_fastapairs = fopen_output(opt_fastapairs);
+      if (ctx->fp_fastapairs == nullptr)
         {
           fatal("Unable to open fastapairs output file for writing");
         }
@@ -619,8 +646,8 @@ auto search_prep(char * cmdline, char * progheader) -> void
 
   if (opt_qsegout != nullptr)
     {
-      fp_qsegout = fopen_output(opt_qsegout);
-      if (fp_qsegout == nullptr)
+      ctx->fp_qsegout = fopen_output(opt_qsegout);
+      if (ctx->fp_qsegout == nullptr)
         {
           fatal("Unable to open qsegout output file for writing");
         }
@@ -628,8 +655,8 @@ auto search_prep(char * cmdline, char * progheader) -> void
 
   if (opt_tsegout != nullptr)
     {
-      fp_tsegout = fopen_output(opt_tsegout);
-      if (fp_tsegout == nullptr)
+      ctx->fp_tsegout = fopen_output(opt_tsegout);
+      if (ctx->fp_tsegout == nullptr)
         {
           fatal("Unable to open tsegout output file for writing");
         }
@@ -637,8 +664,8 @@ auto search_prep(char * cmdline, char * progheader) -> void
 
   if (opt_matched != nullptr)
     {
-      fp_matched = fopen_output(opt_matched);
-      if (fp_matched == nullptr)
+      ctx->fp_matched = fopen_output(opt_matched);
+      if (ctx->fp_matched == nullptr)
         {
           fatal("Unable to open matched output file for writing");
         }
@@ -646,8 +673,8 @@ auto search_prep(char * cmdline, char * progheader) -> void
 
   if (opt_notmatched != nullptr)
     {
-      fp_notmatched = fopen_output(opt_notmatched);
-      if (fp_notmatched == nullptr)
+      ctx->fp_notmatched = fopen_output(opt_notmatched);
+      if (ctx->fp_notmatched == nullptr)
         {
           fatal("Unable to open notmatched output file for writing");
         }
@@ -655,8 +682,8 @@ auto search_prep(char * cmdline, char * progheader) -> void
 
   if (opt_otutabout != nullptr)
     {
-      fp_otutabout = fopen_output(opt_otutabout);
-      if (fp_otutabout == nullptr)
+      ctx->fp_otutabout = fopen_output(opt_otutabout);
+      if (ctx->fp_otutabout == nullptr)
         {
           fatal("Unable to open OTU table (text format) output file for writing");
         }
@@ -664,8 +691,8 @@ auto search_prep(char * cmdline, char * progheader) -> void
 
   if (opt_mothur_shared_out != nullptr)
     {
-      fp_mothur_shared_out = fopen_output(opt_mothur_shared_out);
-      if (fp_mothur_shared_out == nullptr)
+      ctx->fp_mothur_shared_out = fopen_output(opt_mothur_shared_out);
+      if (ctx->fp_mothur_shared_out == nullptr)
         {
           fatal("Unable to open OTU table (mothur format) output file for writing");
         }
@@ -673,8 +700,8 @@ auto search_prep(char * cmdline, char * progheader) -> void
 
   if (opt_biomout != nullptr)
     {
-      fp_biomout = fopen_output(opt_biomout);
-      if (fp_biomout == nullptr)
+      ctx->fp_biomout = fopen_output(opt_biomout);
+      if (ctx->fp_biomout == nullptr)
         {
           fatal("Unable to open OTU table (biom 1.0 format) output file for writing");
         }
@@ -686,19 +713,19 @@ auto search_prep(char * cmdline, char * progheader) -> void
 
   if (is_udb)
     {
-       if (!db_open)  // TODO: this is a hack
-      {
-      udb_read(opt_db, true, true);
-      results_show_samheader(fp_samout, cmdline, opt_db);
-      show_rusage();
-      seqcount = db_getsequencecount();
-      db_open = true;
-      }
+      if (!db_open)  // TODO: this is a hack
+        {
+          udb_read(opt_db, true, true);
+          results_show_samheader(ctx->fp_samout, cmdline, opt_db);
+          show_rusage();
+          db_open = true;
+        }
+      ctx->seqcount = db_getsequencecount();
     }
   else
     {
       db_read(opt_db, 0);
-      results_show_samheader(fp_samout, cmdline, opt_db);
+      results_show_samheader(ctx->fp_samout, cmdline, opt_db);
       if (opt_dbmask == MASK_DUST)
         {
           dust_all();
@@ -708,31 +735,30 @@ auto search_prep(char * cmdline, char * progheader) -> void
           hardmask_all();
         }
       show_rusage();
-      seqcount = db_getsequencecount();
+      ctx->seqcount = db_getsequencecount();
       dbindex_prepare(1, opt_dbmask);
       dbindex_addallsequences(opt_dbmask);
     }
 
   /* tophits = the maximum number of hits we need to store */
 
-  if ((opt_maxrejects == 0) || (opt_maxrejects > seqcount))
+  if ((opt_maxrejects == 0) || (opt_maxrejects > ctx->seqcount))
     {
-      opt_maxrejects = seqcount;
+      opt_maxrejects = ctx->seqcount;
     }
 
-  if ((opt_maxaccepts == 0) || (opt_maxaccepts > seqcount))
+  if ((opt_maxaccepts == 0) || (opt_maxaccepts > ctx->seqcount))
     {
-      opt_maxaccepts = seqcount;
+      opt_maxaccepts = ctx->seqcount;
     }
 
-  tophits = opt_maxrejects + opt_maxaccepts + MAXDELAYED;
+  ctx->tophits = opt_maxrejects + opt_maxaccepts + MAXDELAYED;
 
-  tophits = std::min(tophits, seqcount);
-
+  ctx->tophits = std::min(ctx->tophits, ctx->seqcount);
 }
 
 
-auto search_done(bool skipCloseDB) -> void
+auto search_done(bool skipCloseDB, SearchContext *ctx) -> void
 {
   /* clean up, global */
   if (!skipCloseDB) {
@@ -742,48 +768,48 @@ auto search_done(bool skipCloseDB) -> void
 
   if (opt_lcaout != nullptr)
     {
-      fclose(fp_lcaout);
+      fclose(ctx->fp_lcaout);
     }
   if (opt_matched != nullptr)
     {
-      fclose(fp_matched);
+      fclose(ctx->fp_matched);
     }
   if (opt_notmatched != nullptr)
     {
-      fclose(fp_notmatched);
+      fclose(ctx->fp_notmatched);
     }
   if (opt_fastapairs != nullptr)
     {
-      fclose(fp_fastapairs);
+      fclose(ctx->fp_fastapairs);
     }
   if (opt_qsegout != nullptr)
     {
-      fclose(fp_qsegout);
+      fclose(ctx->fp_qsegout);
     }
   if (opt_tsegout != nullptr)
     {
-      fclose(fp_tsegout);
+      fclose(ctx->fp_tsegout);
     }
-  if (fp_uc != nullptr)
+  if (ctx->fp_uc != nullptr)
     {
-      fclose(fp_uc);
+      fclose(ctx->fp_uc);
     }
-  if (fp_blast6out != nullptr)
+  if (ctx->fp_blast6out != nullptr)
     {
-      fclose(fp_blast6out);
+      fclose(ctx->fp_blast6out);
     }
-  if (fp_userout != nullptr)
+  if (ctx->fp_userout != nullptr)
     {
-      fclose(fp_userout);
+      fclose(ctx->fp_userout);
       clean_up(); // free userfields allocation
     }
-  if (fp_alnout != nullptr)
+  if (ctx->fp_alnout != nullptr)
     {
-      fclose(fp_alnout);
+      fclose(ctx->fp_alnout);
     }
-  if (fp_samout != nullptr)
+  if (ctx->fp_samout != nullptr)
     {
-      fclose(fp_samout);
+      fclose(ctx->fp_samout);
     }
   show_rusage();
 }
@@ -791,12 +817,14 @@ auto search_done(bool skipCloseDB) -> void
 
 auto usearch_global(struct Parameters const & parameters, char * cmdline, char * progheader, char * fastx, bool skipCloseDB) -> void
 {
-  search_prep(cmdline, progheader);
-  
+  SearchContext ctx{};
+
+  search_prep(cmdline, progheader, &ctx);
+
   if (opt_dbmatched != nullptr)
     {
-      fp_dbmatched = fopen_output(opt_dbmatched);
-      if (fp_dbmatched == nullptr)
+      ctx.fp_dbmatched = fopen_output(opt_dbmatched);
+      if (ctx.fp_dbmatched == nullptr)
         {
           fatal("Unable to open dbmatched output file for writing");
         }
@@ -804,79 +832,79 @@ auto usearch_global(struct Parameters const & parameters, char * cmdline, char *
 
   if (opt_dbnotmatched != nullptr)
     {
-      fp_dbnotmatched = fopen_output(opt_dbnotmatched);
-      if (fp_dbnotmatched == nullptr)
+      ctx.fp_dbnotmatched = fopen_output(opt_dbnotmatched);
+      if (ctx.fp_dbnotmatched == nullptr)
         {
           fatal("Unable to open dbnotmatched output file for writing");
         }
     }
 
-  dbmatched = (uint64_t *) xmalloc(seqcount * sizeof(uint64_t *));
-  std::memset(dbmatched, 0, seqcount * sizeof(uint64_t *));
+  ctx.dbmatched = (uint64_t *) xmalloc(ctx.seqcount * sizeof(uint64_t *));
+  std::memset(ctx.dbmatched, 0, ctx.seqcount * sizeof(uint64_t *));
 
   otutable_init();
 
   /* prepare reading of queries */
-  qmatches = 0;
-  qmatches_abundance = 0;
-  queries = 0;
-  queries_abundance = 0;
+  ctx.qmatches = 0;
+  ctx.qmatches_abundance = 0;
+  ctx.queries = 0;
+  ctx.queries_abundance = 0;
   // Modification for server mode to avoid segment fault
-  query_fastx_h = fastx_open(fastx);
+  ctx.query_fastx_h = fastx_open(fastx);
 
   /* allocate memory for thread info */
-  si_plus = (struct searchinfo_s *) xmalloc(opt_threads *
+  ctx.si_plus = (struct searchinfo_s *) xmalloc(opt_threads *
                                             sizeof(struct searchinfo_s));
   if (opt_strand > 1)
     {
-      si_minus = (struct searchinfo_s *) xmalloc(opt_threads *
+      ctx.si_minus = (struct searchinfo_s *) xmalloc(opt_threads *
                                                  sizeof(struct searchinfo_s));
     }
   else
     {
-      si_minus = nullptr;
+      ctx.si_minus = nullptr;
     }
 
-  pthread = (pthread_t *) xmalloc(opt_threads * sizeof(pthread_t));
+  ctx.pthread_arr = (pthread_t *) xmalloc(opt_threads * sizeof(pthread_t));
 
   /* init mutexes for input and output */
-  xpthread_mutex_init(&mutex_input, nullptr);
-  xpthread_mutex_init(&mutex_output, nullptr);
+  xpthread_mutex_init(&ctx.mutex_input, nullptr);
+  xpthread_mutex_init(&ctx.mutex_output, nullptr);
 
-  progress_init("Searching", fastx_get_size(query_fastx_h));
-  search_thread_worker_run();
+  progress_init("Searching", fastx_get_size(ctx.query_fastx_h));
+  search_thread_worker_run(&ctx);
   progress_done();
 
-  xpthread_mutex_destroy(&mutex_output);
-  xpthread_mutex_destroy(&mutex_input);
+  xpthread_mutex_destroy(&ctx.mutex_output);
+  xpthread_mutex_destroy(&ctx.mutex_input);
 
-  xfree(pthread);
-  xfree(si_plus);
-  if (si_minus != nullptr)
+  xfree(ctx.pthread_arr);
+  xfree(ctx.si_plus);
+  if (ctx.si_minus != nullptr)
     {
-      xfree(si_minus);
+      xfree(ctx.si_minus);
     }
 
-  fastx_close(query_fastx_h);
+  fastx_close(ctx.query_fastx_h);
 
   if (! opt_quiet)
     {
       fprintf(stderr, "Matching unique query sequences: %d of %d",
-              qmatches, queries);
-      if (queries > 0)
+              ctx.qmatches, ctx.queries);
+      if (ctx.queries > 0)
         {
-          fprintf(stderr, " (%.2f%%)", 100.0 * qmatches / queries);
+          fprintf(stderr, " (%.2f%%)", 100.0 * ctx.qmatches / ctx.queries);
         }
       fprintf(stderr, "\n");
       if (opt_sizein)
         {
           fprintf(stderr, "Matching total query sequences: %" PRIu64 " of %"
                   PRIu64,
-                  qmatches_abundance, queries_abundance);
-          if (queries_abundance > 0)
+                  ctx.qmatches_abundance, ctx.queries_abundance);
+          if (ctx.queries_abundance > 0)
             {
               fprintf(stderr, " (%.2f%%)",
-                      100.0 * qmatches_abundance / queries_abundance);
+                      100.0 * ctx.qmatches_abundance / ctx.queries_abundance);
             }
           fprintf(stderr, "\n");
         }
@@ -885,21 +913,21 @@ auto usearch_global(struct Parameters const & parameters, char * cmdline, char *
   if (opt_log != nullptr)
     {
       fprintf(fp_log, "Matching unique query sequences: %d of %d",
-              qmatches, queries);
-      if (queries > 0)
+              ctx.qmatches, ctx.queries);
+      if (ctx.queries > 0)
         {
-          fprintf(fp_log, " (%.2f%%)", 100.0 * qmatches / queries);
+          fprintf(fp_log, " (%.2f%%)", 100.0 * ctx.qmatches / ctx.queries);
         }
       fprintf(fp_log, "\n");
       if (opt_sizein)
         {
           fprintf(fp_log, "Matching total query sequences: %" PRIu64 " of %"
                   PRIu64,
-                  qmatches_abundance, queries_abundance);
-          if (queries_abundance > 0)
+                  ctx.qmatches_abundance, ctx.queries_abundance);
+          if (ctx.queries_abundance > 0)
             {
               fprintf(fp_log, " (%.2f%%)",
-                      100.0 * qmatches_abundance / queries_abundance);
+                      100.0 * ctx.qmatches_abundance / ctx.queries_abundance);
             }
           fprintf(fp_log, "\n");
         }
@@ -908,8 +936,8 @@ auto usearch_global(struct Parameters const & parameters, char * cmdline, char *
 
   // Add OTUs with no matches to OTU table
   if ((opt_otutabout != nullptr) || (opt_mothur_shared_out != nullptr) || (opt_biomout != nullptr)) {
-    for (int64_t i = 0; i < seqcount; i++) {
-      if (dbmatched[i] == 0U) {
+    for (int64_t i = 0; i < ctx.seqcount; i++) {
+      if (ctx.dbmatched[i] == 0U) {
         otutable_add(nullptr, db_getheader(i), 0);
       }
     }
@@ -917,20 +945,20 @@ auto usearch_global(struct Parameters const & parameters, char * cmdline, char *
 
   if (opt_biomout != nullptr)
     {
-      otutable_print_biomout(fp_biomout);
-      fclose(fp_biomout);
+      otutable_print_biomout(ctx.fp_biomout);
+      fclose(ctx.fp_biomout);
     }
 
   if (opt_otutabout != nullptr)
     {
-      otutable_print_otutabout(fp_otutabout);
-      fclose(fp_otutabout);
+      otutable_print_otutabout(ctx.fp_otutabout);
+      fclose(ctx.fp_otutabout);
     }
 
   if (opt_mothur_shared_out != nullptr)
     {
-      otutable_print_mothur_shared_out(fp_mothur_shared_out);
-      fclose(fp_mothur_shared_out);
+      otutable_print_mothur_shared_out(ctx.fp_mothur_shared_out);
+      fclose(ctx.fp_mothur_shared_out);
     }
 
   otutable_done();
@@ -940,20 +968,20 @@ auto usearch_global(struct Parameters const & parameters, char * cmdline, char *
 
   if ((opt_dbmatched != nullptr) || (opt_dbnotmatched != nullptr))
     {
-      for (int64_t i = 0; i < seqcount; i++)
+      for (int64_t i = 0; i < ctx.seqcount; i++)
         {
-          if (dbmatched[i] != 0U)
+          if (ctx.dbmatched[i] != 0U)
             {
               count_dbmatched++;
               if (opt_dbmatched != nullptr)
                 {
-                  fasta_print_general(fp_dbmatched,
+                  fasta_print_general(ctx.fp_dbmatched,
                                       nullptr,
                                       db_getsequence(i),
                                       db_getsequencelen(i),
                                       db_getheader(i),
                                       db_getheaderlen(i),
-                                      dbmatched[i],
+                                      ctx.dbmatched[i],
                                       count_dbmatched,
                                       -1.0,
                                       -1, -1, nullptr, 0.0);
@@ -964,7 +992,7 @@ auto usearch_global(struct Parameters const & parameters, char * cmdline, char *
               count_dbnotmatched++;
               if (opt_dbnotmatched != nullptr)
                 {
-                  fasta_print_general(fp_dbnotmatched,
+                  fasta_print_general(ctx.fp_dbnotmatched,
                                       nullptr,
                                       db_getsequence(i),
                                       db_getsequencelen(i),
@@ -979,18 +1007,18 @@ auto usearch_global(struct Parameters const & parameters, char * cmdline, char *
         }
     }
 
-  xfree(dbmatched);
+  xfree(ctx.dbmatched);
 
   if (opt_dbmatched != nullptr)
     {
-      fclose(fp_dbmatched);
+      fclose(ctx.fp_dbmatched);
     }
   if (opt_dbnotmatched != nullptr)
     {
-      fclose(fp_dbnotmatched);
+      fclose(ctx.fp_dbnotmatched);
     }
 
-  search_done(skipCloseDB);
+  search_done(skipCloseDB, &ctx);
 }
 
 auto usearch_global(struct Parameters const & parameters, char * cmdline, char * progheader) -> void
