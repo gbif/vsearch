@@ -145,9 +145,9 @@ bool opt_xee;
 bool opt_xlength;
 bool opt_xsize;
 bool opt_log_server_busy_time = false;
-char * opt_alnout;
+thread_local char * opt_alnout;
 char * opt_biomout;
-char * opt_blast6out;
+thread_local char * opt_blast6out;
 char * opt_borderline;
 char * opt_centroids;
 char * opt_chimeras;
@@ -5783,32 +5783,31 @@ auto cmd_usearch_global(struct Parameters const & parameters) -> void
   usearch_global(parameters, cmdline, prog_header.data());
 }
 
-static std::mutex vsearch_server_mutex; // mutex for global server mode
+// Count of searches currently in flight (0 during DB load, ≥0 at runtime).
+static std::atomic<int> active_searches(0);
 
-// atomic flag to indicate if vsearch is busy processing a request
-static std::atomic<bool> vsearch_busy(false);
-
-// RAII class to set and clear the busy flag
-// NOTE: Currently redundant because the Mongoose event loop is blocking.
-// Kept intentionally to protect against future concurrency/refactors.
+// RAII guard: increments active_searches on construction, decrements on
+// destruction, and optionally logs how long the search took.
 struct BusyGuard {
-  std::atomic<bool>& flag;
+  std::atomic<int>& counter;
   std::chrono::steady_clock::time_point start;
 
-  BusyGuard(std::atomic<bool>& f)
-    : flag(f),
-      start(std::chrono::steady_clock::now()) {}
+  BusyGuard(std::atomic<int>& c)
+    : counter(c),
+      start(std::chrono::steady_clock::now()) {
+    counter.fetch_add(1);
+  }
 
   ~BusyGuard() {
-    flag.store(false);
+    counter.fetch_sub(1);
 
-    if(opt_log_server_busy_time) {
-    auto end = std::chrono::steady_clock::now();
-    auto ms =
-      std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    if (opt_log_server_busy_time) {
+      auto end = std::chrono::steady_clock::now();
+      auto ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
 
-    fprintf(stderr, "[vsearch-server] busy for %lld ms\n",
-            (long long) ms);
+      fprintf(stderr, "[vsearch-server] busy for %lld ms\n",
+              (long long) ms);
     }
   }
 };
@@ -5924,27 +5923,29 @@ static void search_worker()
     PendingSearchResult res;
     res.outfmt = job.outfmt;
 
-    vsearch_busy.store(true);
-    BusyGuard guard(vsearch_busy);
+    BusyGuard guard(active_searches);
 
-    {
-      std::lock_guard<std::mutex> lock(vsearch_server_mutex);
+    res.query_file  = write_temp_fasta(job.sequence.c_str());
+    res.blast6_file = make_temp_output("vsearch-blast6");
+    res.aln_file    = make_temp_output("vsearch-aln");
 
-      res.query_file  = write_temp_fasta(job.sequence.c_str());
-      res.blast6_file = make_temp_output("vsearch-blast6");
-      res.aln_file    = make_temp_output("vsearch-aln");
+    fprintf(stderr, "[DBG] worker tid=%lu starting  conn_id=%lu seq=%.20s aln=%s\n",
+            (unsigned long)pthread_self(), job.conn_id,
+            job.sequence.c_str(), res.aln_file.c_str());
 
-      char *old_blast6out = opt_blast6out;
-      char *old_alnout    = opt_alnout;
-      opt_blast6out = const_cast<char *>(res.blast6_file.c_str());
-      opt_alnout    = const_cast<char *>(res.aln_file.c_str());
+    // opt_blast6out / opt_alnout are thread_local, so setting them here
+    // does not affect any other concurrent worker thread.
+    opt_blast6out = const_cast<char *>(res.blast6_file.c_str());
+    opt_alnout    = const_cast<char *>(res.aln_file.c_str());
 
-      usearch_global_server(*job.parameters, cmdline, prog_header.data(),
-                            const_cast<char *>(res.query_file.c_str()));
+    usearch_global_server(*job.parameters, cmdline, prog_header.data(),
+                          const_cast<char *>(res.query_file.c_str()));
 
-      opt_blast6out = old_blast6out;
-      opt_alnout    = old_alnout;
-    }
+    opt_blast6out = nullptr;
+    opt_alnout    = nullptr;
+
+    fprintf(stderr, "[DBG] worker tid=%lu storing   conn_id=%lu aln=%s\n",
+            (unsigned long)pthread_self(), job.conn_id, res.aln_file.c_str());
 
     {
       std::lock_guard<std::mutex> lock(pending_results_mutex);
@@ -6017,7 +6018,11 @@ static void ev_handler(struct mg_connection *c,
     {
       std::lock_guard<std::mutex> lock(pending_results_mutex);
       auto it = pending_results.find(c->id);
-      if (it == pending_results.end()) return;
+      if (it == pending_results.end()) {
+        fprintf(stderr, "[DBG] wakeup conn_id=%lu NOT FOUND in pending_results\n", c->id);
+        return;
+      }
+      fprintf(stderr, "[DBG] wakeup conn_id=%lu aln=%s\n", c->id, it->second.aln_file.c_str());
       res = std::move(it->second);
       pending_results.erase(it);
     }
@@ -6072,44 +6077,24 @@ static void ev_handler(struct mg_connection *c,
 auto cmd_usearch_global_server_load_db(struct Parameters const & parameters) -> void
 {
 
-bool expected = false;
-  if (!vsearch_busy.compare_exchange_strong(expected, true)) {
+  if (active_searches.load() != 0) {
     fatal("VSEARCH server is already busy, cannot load database");
   }
 
-  std::string query_file;
-  std::string blast6_file;
-  std::string aln_file;
-  std::string result;
+  BusyGuard guard(active_searches);
 
-  BusyGuard guard(vsearch_busy);
-
-    {
-
-    // 🔒 Serialize all vsearch execution
-    std::lock_guard<std::mutex> lock(vsearch_server_mutex);
-
-    // --- create files for a  files ---
-    query_file  = write_temp_fasta("ACGT");
-    blast6_file = make_temp_output("vsearch-blast6");
-    aln_file    = make_temp_output("vsearch-aln");
-
-    // Save original globals
-    char *old_blast6out = opt_blast6out;
-    char *old_alnout    = opt_alnout;
-
-    // Override outputs for this request
-    opt_blast6out = const_cast<char *>(blast6_file.c_str());
-    opt_alnout    = const_cast<char *>(aln_file.c_str());
-
-    // Run vsearch
-    usearch_global_server(parameters, cmdline, prog_header.data(), const_cast<char *>(query_file.c_str()));
-
-    // Restore globals
-    opt_blast6out = old_blast6out;
-    opt_alnout    = old_alnout;
-  }
+  std::string query_file  = write_temp_fasta("ACGT");
+  std::string blast6_file = make_temp_output("vsearch-blast6");
+  std::string aln_file    = make_temp_output("vsearch-aln");
   CleanupGuard cleanup{query_file, blast6_file, aln_file};
+
+  opt_blast6out = const_cast<char *>(blast6_file.c_str());
+  opt_alnout    = const_cast<char *>(aln_file.c_str());
+
+  usearch_global_server(parameters, cmdline, prog_header.data(), const_cast<char *>(query_file.c_str()));
+
+  opt_blast6out = nullptr;
+  opt_alnout    = nullptr;
 
 
 }
@@ -6136,7 +6121,10 @@ auto cmd_usearch_global_server(struct Parameters const & parameters) -> void
    struct mg_mgr mgr;  // Declare event manager
    mg_mgr_init(&mgr);  // Initialise event manager
    mg_wakeup_init(&mgr); // Enable cross-thread wakeup for async /search responses
-   std::thread(search_worker).detach(); // Single worker thread processes the search queue
+   // Launch opt_threads concurrent worker threads, each draining search_queue independently.
+   for (int64_t i = 0; i < opt_threads; i++) {
+     std::thread(search_worker).detach();
+   }
    static ServerContext ctx{
      &parameters, nullptr, nullptr, &mgr
    };

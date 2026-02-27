@@ -75,6 +75,7 @@
 #include <cstdio>  // std::FILE, std::fprintf, std::fclose, std::size_t
 #include <cstring>  // std::strlen, std::memset, std::strcpy
 #include <pthread.h>
+#include <mutex>
 #include <vector>
 
 
@@ -82,6 +83,11 @@
    false→true exactly once (before the server accepts requests) and is
    never written again, so it is safe as a static. */
 static bool db_open = false;
+
+/* Serialises progress_init / progress_done across concurrent searches so
+   their five static globals don't race. progress_update is already called
+   under the per-context mutex_output, so it is not covered here. */
+static std::mutex progress_mutex;
 
 struct SearchContext {
   // Thread management
@@ -842,7 +848,12 @@ auto usearch_global(struct Parameters const & parameters, char * cmdline, char *
   ctx.dbmatched = (uint64_t *) xmalloc(ctx.seqcount * sizeof(uint64_t *));
   std::memset(ctx.dbmatched, 0, ctx.seqcount * sizeof(uint64_t *));
 
-  otutable_init();
+  bool const use_otutable = (opt_otutabout != nullptr) ||
+                             (opt_mothur_shared_out != nullptr) ||
+                             (opt_biomout != nullptr);
+  if (use_otutable) {
+    otutable_init();
+  }
 
   /* prepare reading of queries */
   ctx.qmatches = 0;
@@ -871,9 +882,15 @@ auto usearch_global(struct Parameters const & parameters, char * cmdline, char *
   xpthread_mutex_init(&ctx.mutex_input, nullptr);
   xpthread_mutex_init(&ctx.mutex_output, nullptr);
 
-  progress_init("Searching", fastx_get_size(ctx.query_fastx_h));
+  {
+    std::lock_guard<std::mutex> pg(progress_mutex);
+    progress_init("Searching", fastx_get_size(ctx.query_fastx_h));
+  }
   search_thread_worker_run(&ctx);
-  progress_done();
+  {
+    std::lock_guard<std::mutex> pg(progress_mutex);
+    progress_done();
+  }
 
   xpthread_mutex_destroy(&ctx.mutex_output);
   xpthread_mutex_destroy(&ctx.mutex_input);
@@ -934,34 +951,34 @@ auto usearch_global(struct Parameters const & parameters, char * cmdline, char *
     }
 
 
-  // Add OTUs with no matches to OTU table
-  if ((opt_otutabout != nullptr) || (opt_mothur_shared_out != nullptr) || (opt_biomout != nullptr)) {
+  if (use_otutable) {
+    // Add OTUs with no matches to OTU table
     for (int64_t i = 0; i < ctx.seqcount; i++) {
       if (ctx.dbmatched[i] == 0U) {
         otutable_add(nullptr, db_getheader(i), 0);
       }
     }
+
+    if (opt_biomout != nullptr)
+      {
+        otutable_print_biomout(ctx.fp_biomout);
+        fclose(ctx.fp_biomout);
+      }
+
+    if (opt_otutabout != nullptr)
+      {
+        otutable_print_otutabout(ctx.fp_otutabout);
+        fclose(ctx.fp_otutabout);
+      }
+
+    if (opt_mothur_shared_out != nullptr)
+      {
+        otutable_print_mothur_shared_out(ctx.fp_mothur_shared_out);
+        fclose(ctx.fp_mothur_shared_out);
+      }
+
+    otutable_done();
   }
-
-  if (opt_biomout != nullptr)
-    {
-      otutable_print_biomout(ctx.fp_biomout);
-      fclose(ctx.fp_biomout);
-    }
-
-  if (opt_otutabout != nullptr)
-    {
-      otutable_print_otutabout(ctx.fp_otutabout);
-      fclose(ctx.fp_otutabout);
-    }
-
-  if (opt_mothur_shared_out != nullptr)
-    {
-      otutable_print_mothur_shared_out(ctx.fp_mothur_shared_out);
-      fclose(ctx.fp_mothur_shared_out);
-    }
-
-  otutable_done();
 
   int count_dbmatched = 0;
   int count_dbnotmatched = 0;
