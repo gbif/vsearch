@@ -58,7 +58,19 @@
 
 */
 
-#include <cstdint> // uint64_t
+#include <cstdint>   // uint64_t
+#include <stdexcept> // std::runtime_error
+
+
+// When set to true in a thread, fatal() throws FatalError instead of
+// calling std::exit().  Used by the server worker threads so that
+// bad input (e.g. non-FASTA body) is caught and returned as HTTP 400
+// rather than terminating the whole server process.
+extern thread_local bool fatal_throws;
+
+struct FatalError : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
 
 
 // parameters must be marked as const!

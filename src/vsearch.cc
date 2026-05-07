@@ -5837,6 +5837,7 @@ struct PendingSearchResult {
   std::string outfmt;
   std::string query_file;
   std::string blast6_file;
+  std::string error_message; // non-empty → send 400 instead of streaming
   std::string aln_file;
 };
 
@@ -5848,8 +5849,9 @@ struct SearchJob {
   unsigned long conn_id;
   mg_mgr       *mgr;
   const Parameters *parameters;
-  std::string  sequence;
+  std::string  sequence;    // single-sequence; empty for batch
   std::string  outfmt;
+  std::string  query_file;  // pre-created FASTA path (batch only)
 };
 
 static std::queue<SearchJob>      search_queue;
@@ -5880,6 +5882,24 @@ static std::string write_temp_fasta(const char *sequence)
   fprintf(f, ">search\n%s\n", sequence);
   fclose(f);  // also closes fd
 
+  return std::string(tmpl);
+}
+
+static std::string write_temp_fasta_body(const char *data, size_t len)
+{
+  char tmpl[PATH_MAX];
+  snprintf(tmpl, sizeof(tmpl), "%s/vsearch-query-XXXXXX", opt_temp_file_path);
+  int fd = mkstemp(tmpl);
+  if (fd == -1)
+    fatal("mkstemp failed for batch query file");
+  FILE *f = fdopen(fd, "w");
+  if (!f) {
+    close(fd);
+    unlink(tmpl);
+    fatal("fdopen failed for batch query file");
+  }
+  fwrite(data, 1, len, f);
+  fclose(f);
   return std::string(tmpl);
 }
 
@@ -5925,7 +5945,11 @@ static void search_worker()
 
     BusyGuard guard(active_searches);
 
-    res.query_file  = write_temp_fasta(job.sequence.c_str());
+    if (job.query_file.empty()) {
+      res.query_file = write_temp_fasta(job.sequence.c_str());
+    } else {
+      res.query_file = std::move(job.query_file);
+    }
     res.blast6_file = make_temp_output("vsearch-blast6");
     res.aln_file    = make_temp_output("vsearch-aln");
 
@@ -5938,8 +5962,14 @@ static void search_worker()
     opt_blast6out = const_cast<char *>(res.blast6_file.c_str());
     opt_alnout    = const_cast<char *>(res.aln_file.c_str());
 
-    usearch_global_server(*job.parameters, cmdline, prog_header.data(),
-                          const_cast<char *>(res.query_file.c_str()));
+    fatal_throws = true;
+    try {
+      usearch_global_server(*job.parameters, cmdline, prog_header.data(),
+                            const_cast<char *>(res.query_file.c_str()));
+    } catch (const FatalError &e) {
+      res.error_message = e.what();
+    }
+    fatal_throws = false;
 
     opt_blast6out = nullptr;
     opt_alnout    = nullptr;
@@ -6026,6 +6056,12 @@ static void ev_handler(struct mg_connection *c,
       res = std::move(it->second);
       pending_results.erase(it);
     }
+    if (!res.error_message.empty()) {
+      CleanupGuard cleanup{res.query_file, res.blast6_file, res.aln_file};
+      mg_http_reply(c, 400, "Content-Type: text/plain\r\n",
+                    "Bad request: %s\n", res.error_message.c_str());
+      return;
+    }
     stream_search_result(c, res);
     return;
   }
@@ -6064,10 +6100,34 @@ static void ev_handler(struct mg_connection *c,
     {
       std::lock_guard<std::mutex> lock(search_queue_mutex);
       search_queue.push({c->id, ctx->mgr, ctx->parameters,
-                         std::string(sequence), std::string(outfmt)});
+                         std::string(sequence), std::string(outfmt), /*query_file=*/""});
     }
     search_queue_cv.notify_one();
 
+    return; // Response will arrive via MG_EV_WAKEUP when the job is processed
+  }
+
+  // /search/batch → accept a FASTA body with one or more sequences
+  if (uri_equals(hm->uri, "/search/batch")) {
+    if (mg_strcasecmp(hm->method, mg_str("POST")) != 0) {
+      mg_http_reply(c, 405, "Content-Type: text/plain\r\n", "Method Not Allowed\n");
+      return;
+    }
+    if (hm->body.len == 0) {
+      mg_http_reply(c, 400, "Content-Type: text/plain\r\n", "Empty body\n");
+      return;
+    }
+    auto *ctx = static_cast<ServerContext *>(c->fn_data);
+    std::string query_file = write_temp_fasta_body(hm->body.buf, hm->body.len);
+    char outfmt[1024] = {};
+    mg_http_get_var(&hm->query, "outfmt", outfmt, sizeof(outfmt));
+    {
+      std::lock_guard<std::mutex> lock(search_queue_mutex);
+      search_queue.push({c->id, ctx->mgr, ctx->parameters,
+                         /*sequence=*/"", std::string(outfmt),
+                         std::move(query_file)});
+    }
+    search_queue_cv.notify_one();
     return; // Response will arrive via MG_EV_WAKEUP when the job is processed
   }
 

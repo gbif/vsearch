@@ -59,9 +59,14 @@
 */
 
 #include "vsearch.h"
-#include <cstdint> // uint64_t
-#include <cstdio>  // std::fprintf
+#include "utils/fatal.hpp"
+#include <cstdint>  // uint64_t
+#include <cstdio>   // std::fprintf, std::snprintf
 #include <cstdlib>  // std::exit, EXIT_FAILURE
+#include <string>   // std::string
+
+
+thread_local bool fatal_throws = false;
 
 
 __attribute__((noreturn))
@@ -72,6 +77,10 @@ auto fatal(char const * message) -> void {
   if (fp_log != nullptr) {
     std::fprintf(fp_log, "\n\n");
     std::fprintf(fp_log, "Fatal error: %s\n", message);
+  }
+
+  if (fatal_throws) {
+    throw FatalError(message);
   }
 
   std::exit(EXIT_FAILURE);
@@ -91,6 +100,12 @@ auto fatal(char const * format,
     std::fprintf(fp_log, "\n");
   }
 
+  if (fatal_throws) {
+    char buf[1024];
+    std::snprintf(buf, sizeof(buf), format, message);
+    throw FatalError(buf);
+  }
+
   std::exit(EXIT_FAILURE);
 }
 
@@ -108,6 +123,12 @@ auto fatal(char const * format,
     std::fprintf(fp_log, "\n\nFatal error: ");
     std::fprintf(fp_log, format, symbol, line_number);
     std::fprintf(fp_log, "\n");
+  }
+
+  if (fatal_throws) {
+    char buf[1024];
+    std::snprintf(buf, sizeof(buf), format, symbol, line_number);
+    throw FatalError(buf);
   }
 
   std::exit(EXIT_FAILURE);
