@@ -5950,17 +5950,27 @@ static void search_worker()
     } else {
       res.query_file = std::move(job.query_file);
     }
-    res.blast6_file = make_temp_output("vsearch-blast6");
-    res.aln_file    = make_temp_output("vsearch-aln");
 
-    fprintf(stderr, "[DBG] worker tid=%lu starting  conn_id=%lu seq=%.20s aln=%s\n",
-            (unsigned long)pthread_self(), job.conn_id,
-            job.sequence.c_str(), res.aln_file.c_str());
+    // Only produce the output format the client requested (see
+    // stream_search_result). Writing the other format too just makes the
+    // search engine format and write results that get thrown away.
+    // opt_blast6out / opt_alnout are thread_local, so setting them here does
+    // not affect any other concurrent worker thread.
+    const bool want_blast6 = (job.outfmt == "blast6out");
+    if (want_blast6) {
+      res.blast6_file = make_temp_output("vsearch-blast6");
+      opt_blast6out   = const_cast<char *>(res.blast6_file.c_str());
+      opt_alnout      = nullptr;
+    } else {
+      res.aln_file  = make_temp_output("vsearch-aln");
+      opt_alnout    = const_cast<char *>(res.aln_file.c_str());
+      opt_blast6out = nullptr;
+    }
+    // const std::string &out_file = want_blast6 ? res.blast6_file : res.aln_file;
 
-    // opt_blast6out / opt_alnout are thread_local, so setting them here
-    // does not affect any other concurrent worker thread.
-    opt_blast6out = const_cast<char *>(res.blast6_file.c_str());
-    opt_alnout    = const_cast<char *>(res.aln_file.c_str());
+    // fprintf(stderr, "[DBG] worker tid=%lu starting  conn_id=%lu seq=%.20s out=%s\n",
+    //         (unsigned long)pthread_self(), job.conn_id,
+    //         job.sequence.c_str(), out_file.c_str());
 
     fatal_throws = true;
     try {
@@ -5974,8 +5984,8 @@ static void search_worker()
     opt_blast6out = nullptr;
     opt_alnout    = nullptr;
 
-    fprintf(stderr, "[DBG] worker tid=%lu storing   conn_id=%lu aln=%s\n",
-            (unsigned long)pthread_self(), job.conn_id, res.aln_file.c_str());
+    // fprintf(stderr, "[DBG] worker tid=%lu storing   conn_id=%lu out=%s\n",
+    //         (unsigned long)pthread_self(), job.conn_id, out_file.c_str());
 
     {
       std::lock_guard<std::mutex> lock(pending_results_mutex);
@@ -6049,10 +6059,10 @@ static void ev_handler(struct mg_connection *c,
       std::lock_guard<std::mutex> lock(pending_results_mutex);
       auto it = pending_results.find(c->id);
       if (it == pending_results.end()) {
-        fprintf(stderr, "[DBG] wakeup conn_id=%lu NOT FOUND in pending_results\n", c->id);
+        // fprintf(stderr, "[DBG] wakeup conn_id=%lu NOT FOUND in pending_results\n", c->id);
         return;
       }
-      fprintf(stderr, "[DBG] wakeup conn_id=%lu aln=%s\n", c->id, it->second.aln_file.c_str());
+      // fprintf(stderr, "[DBG] wakeup conn_id=%lu aln=%s\n", c->id, it->second.aln_file.c_str());
       res = std::move(it->second);
       pending_results.erase(it);
     }
