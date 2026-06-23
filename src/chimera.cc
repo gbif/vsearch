@@ -963,7 +963,10 @@ auto eval_parents_long(struct chimera_info_s * ci) -> Status
 
   xpthread_mutex_lock(&mutex_output);
 
-  if ((opt_alnout != nullptr) and (status == Status::chimeric))
+  // NB: gate on the file handle, not opt_alnout — the latter is thread_local
+  // (server mode) and reads as nullptr on this worker thread. fp_uchimealns is
+  // a normal static opened on the main thread from opt_alnout.
+  if ((fp_uchimealns != nullptr) and (status == Status::chimeric))
     {
       std::fprintf(fp_uchimealns, "\n");
       std::fprintf(fp_uchimealns, "----------------------------------------"
