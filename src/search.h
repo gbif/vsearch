@@ -59,4 +59,4 @@
 */
 
 auto usearch_global(struct Parameters const & parameters, char * cmdline, char * progheader) -> void;
-auto usearch_global_server(struct Parameters const & parameters, char * cmdline, char * progheader, char * query_file, bool * out_truncated = nullptr, int * out_candidates_dropped = nullptr) -> void;
+auto usearch_global_server(struct Parameters const & parameters, char * cmdline, char * progheader, char * query_file, int nseqs = 0, bool * out_truncated = nullptr, int * out_candidates_dropped = nullptr) -> void;

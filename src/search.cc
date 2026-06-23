@@ -95,6 +95,10 @@ struct SearchContext {
   struct searchinfo_s *si_minus        = nullptr;
   pthread_t           *pthread_arr     = nullptr;
   pthread_attr_t       attr            {};
+  // effective threads for THIS search = min(opt_threads, #query sequences).
+  // Avoids spawning/allocating opt_threads inner threads when fewer queries
+  // exist (e.g. a single GET, or a small cached batch). Set in usearch_global.
+  int                  nthreads        = 0;
 
   // Query input
   fastx_handle         query_fastx_h   = nullptr;
@@ -576,10 +580,10 @@ auto search_thread_worker_run(SearchContext *ctx) -> void
   xpthread_attr_init(&ctx->attr);
   xpthread_attr_setdetachstate(&ctx->attr, PTHREAD_CREATE_JOINABLE);
 
-  auto *thread_args = new ThreadArgs[opt_threads];
+  auto *thread_args = new ThreadArgs[ctx->nthreads];
 
   /* init and create worker threads, put them into stand-by mode */
-  for (int t = 0; t < opt_threads; t++)
+  for (int t = 0; t < ctx->nthreads; t++)
     {
       search_thread_init(ctx->si_plus + t, ctx);
       if (ctx->si_minus != nullptr)
@@ -592,7 +596,7 @@ auto search_thread_worker_run(SearchContext *ctx) -> void
     }
 
   /* finish and clean up worker threads */
-  for (int t = 0; t < opt_threads; t++)
+  for (int t = 0; t < ctx->nthreads; t++)
     {
       xpthread_join(ctx->pthread_arr[t], nullptr);
       search_thread_exit(ctx->si_plus + t);
@@ -848,7 +852,7 @@ auto search_done(bool skipCloseDB, SearchContext *ctx) -> void
 }
 
 
-auto usearch_global(struct Parameters const & parameters, char * cmdline, char * progheader, char * fastx, bool skipCloseDB, bool * out_truncated = nullptr, int * out_candidates_dropped = nullptr) -> void
+auto usearch_global(struct Parameters const & parameters, char * cmdline, char * progheader, char * fastx, bool skipCloseDB, int nseqs = 0, bool * out_truncated = nullptr, int * out_candidates_dropped = nullptr) -> void
 {
   SearchContext ctx{};
 
@@ -890,12 +894,26 @@ auto usearch_global(struct Parameters const & parameters, char * cmdline, char *
   // Modification for server mode to avoid segment fault
   ctx.query_fastx_h = fastx_open(fastx);
 
+  /* Cap the inner thread count to the number of query sequences: no point
+     spawning (and allocating per-thread, seqcount-sized buffers for) more
+     threads than there are queries to process. nseqs <= 0 means "unknown"
+     (e.g. CLI path), so fall back to opt_threads. */
+  ctx.nthreads = static_cast<int>(opt_threads);
+  if ((nseqs > 0) && (nseqs < ctx.nthreads))
+    {
+      ctx.nthreads = nseqs;
+    }
+  if (ctx.nthreads < 1)
+    {
+      ctx.nthreads = 1;
+    }
+
   /* allocate memory for thread info */
-  ctx.si_plus = (struct searchinfo_s *) xmalloc(opt_threads *
+  ctx.si_plus = (struct searchinfo_s *) xmalloc(ctx.nthreads *
                                             sizeof(struct searchinfo_s));
   if (opt_strand > 1)
     {
-      ctx.si_minus = (struct searchinfo_s *) xmalloc(opt_threads *
+      ctx.si_minus = (struct searchinfo_s *) xmalloc(ctx.nthreads *
                                                  sizeof(struct searchinfo_s));
     }
   else
@@ -903,7 +921,7 @@ auto usearch_global(struct Parameters const & parameters, char * cmdline, char *
       ctx.si_minus = nullptr;
     }
 
-  ctx.pthread_arr = (pthread_t *) xmalloc(opt_threads * sizeof(pthread_t));
+  ctx.pthread_arr = (pthread_t *) xmalloc(ctx.nthreads * sizeof(pthread_t));
 
   /* init mutexes for input and output */
   xpthread_mutex_init(&ctx.mutex_input, nullptr);
@@ -1079,7 +1097,7 @@ auto usearch_global(struct Parameters const & parameters, char * cmdline, char *
   usearch_global(parameters, cmdline, progheader, parameters.opt_usearch_global, false); // original behaviour
 }
 
-auto usearch_global_server(struct Parameters const & parameters, char * cmdline, char * progheader, char * query_file, bool * out_truncated, int * out_candidates_dropped) -> void
+auto usearch_global_server(struct Parameters const & parameters, char * cmdline, char * progheader, char * query_file, int nseqs, bool * out_truncated, int * out_candidates_dropped) -> void
 {
-  usearch_global(parameters, cmdline, progheader, query_file, true, out_truncated, out_candidates_dropped);   // skips the udb opening
+  usearch_global(parameters, cmdline, progheader, query_file, true, nseqs, out_truncated, out_candidates_dropped);   // skips the udb opening
 }

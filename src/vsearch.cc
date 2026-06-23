@@ -5854,6 +5854,7 @@ struct SearchJob {
   std::string  sequence;    // single-sequence; empty for batch
   std::string  outfmt;
   std::string  query_file;  // pre-created FASTA path (batch only)
+  int          nseqs;       // #query sequences; caps inner thread allocation
 };
 
 static std::queue<SearchJob>      search_queue;
@@ -5903,6 +5904,19 @@ static std::string write_temp_fasta_body(const char *data, size_t len)
   fwrite(data, 1, len, f);
   fclose(f);
   return std::string(tmpl);
+}
+
+// Count FASTA records in a raw body (headers at line start). Used to cap the
+// search's inner thread count to the number of sequences actually present.
+static int count_fasta_sequences(const char *data, size_t len)
+{
+  int n = 0;
+  for (size_t i = 0; i < len; i++) {
+    if (data[i] == '>' && (i == 0 || data[i - 1] == '\n')) {
+      ++n;
+    }
+  }
+  return n;
 }
 
 static std::string make_temp_output(const char *prefix)
@@ -5978,7 +5992,7 @@ static void search_worker()
     try {
       usearch_global_server(*job.parameters, cmdline, prog_header.data(),
                             const_cast<char *>(res.query_file.c_str()),
-                            &res.truncated, &res.candidates_dropped);
+                            job.nseqs, &res.truncated, &res.candidates_dropped);
     } catch (const FatalError &e) {
       res.error_message = e.what();
     }
@@ -6117,7 +6131,8 @@ static void ev_handler(struct mg_connection *c,
     {
       std::lock_guard<std::mutex> lock(search_queue_mutex);
       search_queue.push({c->id, ctx->mgr, ctx->parameters,
-                         std::string(sequence), std::string(outfmt), /*query_file=*/""});
+                         std::string(sequence), std::string(outfmt), /*query_file=*/"",
+                         /*nseqs=*/1});
     }
     search_queue_cv.notify_one();
 
@@ -6136,13 +6151,14 @@ static void ev_handler(struct mg_connection *c,
     }
     auto *ctx = static_cast<ServerContext *>(c->fn_data);
     std::string query_file = write_temp_fasta_body(hm->body.buf, hm->body.len);
+    int nseqs = count_fasta_sequences(hm->body.buf, hm->body.len);
     char outfmt[1024] = {};
     mg_http_get_var(&hm->query, "outfmt", outfmt, sizeof(outfmt));
     {
       std::lock_guard<std::mutex> lock(search_queue_mutex);
       search_queue.push({c->id, ctx->mgr, ctx->parameters,
                          /*sequence=*/"", std::string(outfmt),
-                         std::move(query_file)});
+                         std::move(query_file), nseqs});
     }
     search_queue_cv.notify_one();
     return; // Response will arrive via MG_EV_WAKEUP when the job is processed
