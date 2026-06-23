@@ -5812,6 +5812,48 @@ struct BusyGuard {
   }
 };
 
+// Global budget of inner search threads, shared across all concurrent searches.
+// Each search asks for up to `desired` threads but is granted at least 1 and at
+// most what is currently free, so the TOTAL inner threads in flight never exceeds
+// the budget (set to opt_threads). Without this, N concurrent batches could each
+// spawn opt_threads inner threads → opt_threads² oversubscription on the big DB.
+class ThreadBudget {
+  std::mutex m;
+  std::condition_variable cv;
+  int available;
+public:
+  explicit ThreadBudget(int n) : available(n > 0 ? n : 1) {}
+
+  // Block until >=1 permit is free, then take min(desired, free) (>=1).
+  int acquire(int desired) {
+    if (desired < 1) { desired = 1; }
+    std::unique_lock<std::mutex> lock(m);
+    cv.wait(lock, [this] { return available > 0; });
+    int grant = (desired < available) ? desired : available;
+    available -= grant;
+    return grant;
+  }
+
+  void release(int n) {
+    {
+      std::lock_guard<std::mutex> lock(m);
+      available += n;
+    }
+    cv.notify_all();
+  }
+};
+
+// Set in cmd_usearch_global_server once opt_threads is known, before workers start.
+static ThreadBudget * search_thread_budget = nullptr;
+
+// RAII: return granted thread permits to the budget when the search finishes.
+struct BudgetGuard {
+  int granted;
+  ~BudgetGuard() {
+    if (search_thread_budget != nullptr) { search_thread_budget->release(granted); }
+  }
+};
+
 // RAII class to clean up temporary files
 struct CleanupGuard {
   std::string query;
@@ -5961,6 +6003,19 @@ static void search_worker()
 
     BusyGuard guard(active_searches);
 
+    // Reserve inner-thread permits from the global budget so that concurrent
+    // searches together never exceed opt_threads inner threads. desired is what
+    // this search would use in isolation (min(opt_threads, nseqs)); granted is
+    // >=1 and <= what is currently free. Blocks here if the budget is exhausted.
+    int desired = (job.nseqs > 0)
+      ? ((static_cast<int>(opt_threads) < job.nseqs)
+           ? static_cast<int>(opt_threads) : job.nseqs)
+      : static_cast<int>(opt_threads);
+    int granted = (search_thread_budget != nullptr)
+      ? search_thread_budget->acquire(desired)
+      : desired;
+    BudgetGuard budget_guard{granted};
+
     if (job.query_file.empty()) {
       res.query_file = write_temp_fasta(job.sequence.c_str());
     } else {
@@ -5992,7 +6047,7 @@ static void search_worker()
     try {
       usearch_global_server(*job.parameters, cmdline, prog_header.data(),
                             const_cast<char *>(res.query_file.c_str()),
-                            job.nseqs, &res.truncated, &res.candidates_dropped);
+                            granted, &res.truncated, &res.candidates_dropped);
     } catch (const FatalError &e) {
       res.error_message = e.what();
     }
@@ -6214,6 +6269,11 @@ auto cmd_usearch_global_server(struct Parameters const & parameters) -> void
    struct mg_mgr mgr;  // Declare event manager
    mg_mgr_init(&mgr);  // Initialise event manager
    mg_wakeup_init(&mgr); // Enable cross-thread wakeup for async /search responses
+   // Shared inner-thread budget: total inner threads across all concurrent
+   // searches is capped at opt_threads, preventing opt_threads² oversubscription
+   // when several multi-sequence batches run at once.
+   static ThreadBudget budget(static_cast<int>(opt_threads));
+   search_thread_budget = &budget;
    // Launch opt_threads concurrent worker threads, each draining search_queue independently.
    for (int64_t i = 0; i < opt_threads; i++) {
      std::thread(search_worker).detach();
