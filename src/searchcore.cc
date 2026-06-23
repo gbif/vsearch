@@ -312,11 +312,13 @@ auto search_topscores(struct searchinfo_s * searchinfo) -> void
 
   auto const minmatches = std::min(static_cast<unsigned int>(opt_minwordmatches), searchinfo->kmersamplecount);
 
+  int qualifiers = 0;
   for (auto i = 0; i < indexed_count; i++)
     {
       auto const count = searchinfo->kmers[i];
       if (count >= minmatches)
         {
+          ++qualifiers;
           auto const seqno = dbindex_getmapping(i);
           unsigned int const length = db_getsequencelen(seqno);
 
@@ -328,6 +330,13 @@ auto search_topscores(struct searchinfo_s * searchinfo) -> void
           minheap_add(searchinfo->m, & novel);
         }
     }
+
+  /* Candidates that cleared the k-mer floor but did not fit the bounded heap
+     (capacity = maxaccepts + maxrejects + MAXDELAYED) are silently discarded
+     by minheap_add. Record the overflow so the caller can report that the
+     candidate pool was truncated at selection time. */
+  searchinfo->candidates_dropped =
+    (qualifiers > searchinfo->m->alloc) ? (qualifiers - searchinfo->m->alloc) : 0;
 
   minheap_sort(searchinfo->m);
 }
@@ -814,6 +823,12 @@ auto search_onequery(struct searchinfo_s * searchinfo, int seqmask) -> void
     {
       align_delayed(searchinfo);
     }
+
+  /* Candidates still sitting in the heap entered the candidate set but were
+     never examined because the accept/reject caps stopped the loop early.
+     Add them to the count recorded by search_topscores: the total is the
+     number of k-mer-qualifying targets this query never evaluated. */
+  searchinfo->candidates_dropped += searchinfo->m->count;
 
   delete searchinfo->lma;
 }

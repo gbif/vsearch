@@ -113,6 +113,15 @@ struct SearchContext {
   int      queries            = 0;
   uint64_t queries_abundance  = 0;
 
+  // Search-completeness tracking (aggregated under mutex_output).
+  // any_truncated: at least one query left k-mer-qualifying candidates
+  //   unevaluated (loop capped and/or candidate pool truncated at selection).
+  // max_candidates_dropped: the largest such shortfall across all queries —
+  //   a per-request magnitude hint for how much higher maxaccepts/maxrejects
+  //   would need to go to clear the worst query.
+  bool any_truncated          = false;
+  int  max_candidates_dropped = 0;
+
   // DB hit tracking
   uint64_t *dbmatched = nullptr;
 
@@ -471,6 +480,23 @@ auto search_thread_run(int64_t t, SearchContext *ctx) -> void
               ctx->qmatches_abundance += qsize;
             }
 
+          /* aggregate search-completeness across queries (worst case over
+             strands and over all queries) */
+          int dropped = ctx->si_plus[t].candidates_dropped;
+          if ((opt_strand > 1) &&
+              (ctx->si_minus[t].candidates_dropped > dropped))
+            {
+              dropped = ctx->si_minus[t].candidates_dropped;
+            }
+          if (dropped > 0)
+            {
+              ctx->any_truncated = true;
+            }
+          if (dropped > ctx->max_candidates_dropped)
+            {
+              ctx->max_candidates_dropped = dropped;
+            }
+
           /* show progress */
           progress_update(progress);
 
@@ -488,6 +514,7 @@ auto search_thread_run(int64_t t, SearchContext *ctx) -> void
 auto search_thread_init(struct searchinfo_s * si, SearchContext *ctx) -> void
 {
   /* thread specific initialiation */
+  si->candidates_dropped = 0;  // si is xmalloc'd, not constructed
   si->uh = unique_init();
   si->kmers = (count_t *) xmalloc((ctx->seqcount * sizeof(count_t)) + 32);
   si->m = minheap_init(ctx->tophits);
@@ -821,7 +848,7 @@ auto search_done(bool skipCloseDB, SearchContext *ctx) -> void
 }
 
 
-auto usearch_global(struct Parameters const & parameters, char * cmdline, char * progheader, char * fastx, bool skipCloseDB) -> void
+auto usearch_global(struct Parameters const & parameters, char * cmdline, char * progheader, char * fastx, bool skipCloseDB, bool * out_truncated = nullptr, int * out_candidates_dropped = nullptr) -> void
 {
   SearchContext ctx{};
 
@@ -1035,6 +1062,15 @@ auto usearch_global(struct Parameters const & parameters, char * cmdline, char *
       fclose(ctx.fp_dbnotmatched);
     }
 
+  if (out_truncated != nullptr)
+    {
+      *out_truncated = ctx.any_truncated;
+    }
+  if (out_candidates_dropped != nullptr)
+    {
+      *out_candidates_dropped = ctx.max_candidates_dropped;
+    }
+
   search_done(skipCloseDB, &ctx);
 }
 
@@ -1043,7 +1079,7 @@ auto usearch_global(struct Parameters const & parameters, char * cmdline, char *
   usearch_global(parameters, cmdline, progheader, parameters.opt_usearch_global, false); // original behaviour
 }
 
-auto usearch_global_server(struct Parameters const & parameters, char * cmdline, char * progheader, char * query_file) -> void
+auto usearch_global_server(struct Parameters const & parameters, char * cmdline, char * progheader, char * query_file, bool * out_truncated, int * out_candidates_dropped) -> void
 {
-  usearch_global(parameters, cmdline, progheader, query_file, true);   // skips the udb opening
+  usearch_global(parameters, cmdline, progheader, query_file, true, out_truncated, out_candidates_dropped);   // skips the udb opening
 }

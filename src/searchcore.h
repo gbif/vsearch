@@ -152,6 +152,11 @@ struct searchinfo_s
   int rejects = 0;                  /* number of rejects */
   struct minheap_s * m = nullptr;   /* min heap with the top kmer db seqs */
   int finalized = 0;
+  int candidates_dropped = 0;       /* k-mer-qualifying targets never evaluated:
+                                       heap-capacity overflow at selection plus
+                                       any left unexamined when the accept/reject
+                                       caps stopped the loop. >0 ⇒ result for this
+                                       query may be incomplete (see search.cc). */
 };
 
 auto search_topscores(struct searchinfo_s * searchinfo) -> void;

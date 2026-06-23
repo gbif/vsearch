@@ -5839,6 +5839,8 @@ struct PendingSearchResult {
   std::string blast6_file;
   std::string error_message; // non-empty → send 400 instead of streaming
   std::string aln_file;
+  bool truncated = false;          // any query left k-mer candidates unevaluated
+  int  candidates_dropped = 0;     // worst-case shortfall across queries
 };
 
 static std::mutex pending_results_mutex;
@@ -5975,7 +5977,8 @@ static void search_worker()
     fatal_throws = true;
     try {
       usearch_global_server(*job.parameters, cmdline, prog_header.data(),
-                            const_cast<char *>(res.query_file.c_str()));
+                            const_cast<char *>(res.query_file.c_str()),
+                            &res.truncated, &res.candidates_dropped);
     } catch (const FatalError &e) {
       res.error_message = e.what();
     }
@@ -6028,8 +6031,12 @@ static void stream_search_result(struct mg_connection *c, PendingSearchResult &r
   mg_printf(c,
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: text/plain\r\n"
+            "X-Vsearch-Search-Truncated: %s\r\n"
+            "X-Vsearch-Candidates-Dropped: %d\r\n"
             "Transfer-Encoding: chunked\r\n"
-            "\r\n");
+            "\r\n",
+            res.truncated ? "true" : "false",
+            res.candidates_dropped);
 
   char buf[4096];
   char chunk[8192 + 64];
